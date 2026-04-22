@@ -217,6 +217,119 @@ def chat(payload: ChatIn):
         raise HTTPException(500, f"Chat error: {e}")
 
 
+# ---- GHL-native SMS reply webhook ----------------------------------------
+# Accepts whatever shape GHL sends ({body: str, contact: {...}, customData: {...}}
+# and returns a JSON response that GHL's workflow can use to send an SMS back.
+#
+# GHL workflow setup:
+#   Trigger: Customer Replied (SMS)
+#   Step 1: Webhook → POST https://bureau-bullies.onrender.com/webhooks/ghl/sms-reply
+#           Body: {
+#             "message": "{{message.body}}",
+#             "first_name": "{{contact.first_name}}",
+#             "contact_id": "{{contact.id}}",
+#             "custom_fields": {
+#               "cr_top_collection_name": "{{custom_values.cr_top_collection_name}}",
+#               "cr_total_leverage": "{{custom_values.cr_total_leverage}}",
+#               "cr_violations_count": "{{custom_values.cr_violations_count}}",
+#               "cr_recommended_tier": "{{contact.cr_recommended_tier}}",
+#               "cr_top_pain_point": "{{contact.cr_top_pain_point}}",
+#               "cr_exec_summary":   "{{contact.cr_exec_summary}}"
+#             }
+#           }
+#   Step 2: Send SMS → Message body: {{webhook.response.reply}}
+@app.post("/webhooks/ghl/sms-reply")
+async def ghl_sms_reply(request: Request):
+    """
+    Accept an inbound SMS reply from GHL and route it through Bully AI.
+    Returns a shape GHL's workflow can use to send the response SMS.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    # GHL can send in many shapes — be liberal in what we accept.
+    message = (
+        payload.get("message")
+        or payload.get("body")
+        or payload.get("sms")
+        or payload.get("text")
+        or ""
+    ).strip()
+
+    if not message:
+        logger.warning("SMS reply webhook received empty message: %s", payload)
+        return {"reply": "Got your message — let me pull your report and get right back to you.", "ok": False}
+
+    # Gather as much contact context as GHL passed
+    first_name = (
+        payload.get("first_name")
+        or payload.get("firstName")
+        or (payload.get("contact") or {}).get("first_name")
+        or ""
+    )
+
+    # Merge custom_fields + top-level cr_* fields + contact custom field dump
+    custom = {}
+    for k, v in payload.items():
+        if k.startswith("cr_") and v not in (None, ""):
+            custom[k] = v
+    for k, v in (payload.get("custom_fields") or {}).items():
+        if v not in (None, ""):
+            custom[k] = v
+    for k, v in (payload.get("customData") or {}).items():
+        if v not in (None, ""):
+            custom[k] = v
+    contact_block = payload.get("contact") or {}
+    for k, v in contact_block.items():
+        if k.startswith("cr_") and v not in (None, ""):
+            custom[k] = v
+
+    if first_name and "cr_first_name" not in custom:
+        custom["cr_first_name"] = first_name
+
+    history = payload.get("history") or []
+
+    logger.info(
+        "SMS reply from %s: %r  (ctx keys: %s)",
+        first_name or "unknown", message[:80], list(custom.keys())[:8]
+    )
+
+    try:
+        reply_text = bully_chat(
+            user_message=message,
+            contact_context=custom or None,
+            history=history,
+        )
+    except Exception as e:
+        logger.exception("SMS reply chat failed")
+        # Graceful fallback — never return 500 to GHL so the workflow doesn't break
+        reply_text = (
+            f"{first_name + ' — ' if first_name else ''}"
+            "Bully AI here. Got your message. Give me a few minutes and I'll get "
+            "back to you with a real answer. — BB"
+        )
+
+    # Heuristic: figure out if Bully AI's reply mentions a link so GHL can
+    # route through the right follow-up workflow if it wants
+    lower = reply_text.lower()
+    link_sent = None
+    if "thecollectionkiller.com/dispute-vault" in lower:
+        link_sent = "vault"
+    elif "suethemallwithus.com" in lower or "dfy" in lower:
+        link_sent = "dfy"
+    elif "thecollectionkiller.com" in lower:
+        link_sent = "toolkit"
+
+    return {
+        "ok": True,
+        "reply": reply_text,
+        "link_sent": link_sent,
+        "first_name": first_name,
+    }
+
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
@@ -229,4 +342,4 @@ if __name__ == "__main__":
         "app:app",
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8000")),
-     )
+    )

@@ -221,6 +221,90 @@ class GHLClient:
         if not r.ok:
             raise GHLError(f"add_tags: {r.status_code} {r.text[:300]}")
 
+    # ---- Global Custom Values (for {{custom_values.X}} merge tags in SMS)
+    _cv_cache: dict = {}
+
+    def list_custom_values(self) -> list:
+        """List global custom values (used in SMS templates as {{custom_values.X}})."""
+        if self.version == "v1":
+            url = f"{V1_BASE}/custom-values/"
+        else:
+            url = f"{V2_BASE}/locations/{self.location_id}/customValues"
+        r = requests.get(url, headers=self._headers, timeout=20)
+        if not r.ok:
+            raise GHLError(f"list_custom_values: {r.status_code} {r.text[:300]}")
+        data = r.json()
+        return data.get("customValues") or data.get("custom_values") or []
+
+    def upsert_custom_value(self, name: str, value: str) -> None:
+        """Create or update a global custom value by name. Safe to call repeatedly."""
+        # Cache existing values on first call
+        if not self._cv_cache:
+            try:
+                for cv in self.list_custom_values():
+                    k = cv.get("name") or cv.get("fieldKey", "")
+                    if k:
+                        self._cv_cache[k] = cv.get("id") or cv.get("_id")
+            except Exception as e:
+                logger.warning("Could not load custom values cache: %s", e)
+
+        value_str = "" if value is None else str(value)
+        cv_id = self._cv_cache.get(name)
+
+        try:
+            if cv_id:
+                # UPDATE existing
+                if self.version == "v1":
+                    url = f"{V1_BASE}/custom-values/{cv_id}"
+                else:
+                    url = f"{V2_BASE}/locations/{self.location_id}/customValues/{cv_id}"
+                r = requests.put(url, headers=self._headers, json={"name": name, "value": value_str}, timeout=15)
+            else:
+                # CREATE new
+                if self.version == "v1":
+                    url = f"{V1_BASE}/custom-values/"
+                else:
+                    url = f"{V2_BASE}/locations/{self.location_id}/customValues"
+                r = requests.post(url, headers=self._headers, json={"name": name, "value": value_str}, timeout=15)
+
+            if r.ok:
+                body = r.json() if r.content else {}
+                new_id = (body.get("customValue") or body).get("id") or (body.get("customValue") or body).get("_id")
+                if new_id and not cv_id:
+                    self._cv_cache[name] = new_id
+                logger.info("Custom value upsert OK: %s = %s", name, value_str[:40])
+            else:
+                logger.warning("Custom value upsert failed (%s): %s — %s", name, r.status_code, r.text[:200])
+        except Exception as e:
+            logger.warning("Custom value upsert error (%s): %s", name, e)
+
+    def push_scan_custom_values(self, custom_fields: dict) -> None:
+        """
+        Push scan data into global custom values so SMS templates using
+        {{custom_values.cr_top_collection_name}} etc. will actually resolve.
+
+        NOTE: global custom values are shared across the sub-account. Every new
+        scan overwrites the previous scanner's values. This is acceptable for
+        launch-phase volume (scans are seconds apart, SMS fires within 60 sec).
+        """
+        # Fields that appear in SMS templates — push each
+        SMS_RELEVANT = [
+            "cr_top_collection_name",
+            "cr_top_collection_amount",
+            "cr_violations_count",
+            "cr_total_leverage",
+            "cr_fico_range",
+            "cr_urgency_hook",
+            "cr_fear_hook",
+            "cr_case_law_cited",
+            "cr_top_pain_point",
+            "cr_exec_summary",
+            "cr_recommended_tier",
+        ]
+        for key in SMS_RELEVANT:
+            if key in custom_fields:
+                self.upsert_custom_value(key, custom_fields[key])
+
 
 # ---- High-level: push an analyzed lead end-to-end ------------------------
 def push_lead_to_ghl(
@@ -255,6 +339,15 @@ def push_lead_to_ghl(
     )
 
     contact_id = (result.get("contact") or result).get("id") or (result.get("contact") or result).get("_id")
+
+    # Mirror scan data into GLOBAL custom values so SMS templates using
+    # {{custom_values.cr_top_collection_name}} etc. actually resolve.
+    # (Workaround: per-contact custom fields would require editing every SMS
+    # template from {{custom_values.cr_*}} to {{contact.cr_*}}.)
+    try:
+        client.push_scan_custom_values(custom_fields)
+    except Exception as e:
+        logger.warning("push_scan_custom_values failed: %s", e)
 
     workflow_map = {
         "toolkit":     os.getenv("GHL_WORKFLOW_TOOLKIT"),

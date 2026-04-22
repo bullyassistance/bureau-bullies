@@ -287,6 +287,84 @@ class GHLClient:
         scan overwrites the previous scanner's values. This is acceptable for
         launch-phase volume (scans are seconds apart, SMS fires within 60 sec).
         """
+        # ---- Sanitize the opener so the SMS never says nonsense ----------
+        # The SMS template reads:
+        #   "That {{cr_top_collection_name}} collection (${{cr_top_collection_amount}})
+        #    is still inside the statute of limitations..."
+        # If there are no collections we need the opener to pivot to charge-offs
+        # or late payments so Bully AI isn't saying "sue no one".
+        sanitized = dict(custom_fields)  # don't mutate caller's dict
+
+        top_name = str(sanitized.get("cr_top_collection_name", "") or "").strip()
+        top_amt  = float(sanitized.get("cr_top_collection_amount", 0) or 0)
+
+        # If analyzer returned placeholder text or $0, pivot to next-worst item
+        bad_name = (
+            not top_name
+            or top_name.upper().startswith("N/A")
+            or "no collection" in top_name.lower()
+            or top_amt <= 0
+        )
+        if bad_name:
+            # Re-derive the opener from what's actually on the report
+            chargeoffs = float(sanitized.get("cr_chargeoffs_value", 0) or 0)
+            late_count = int(sanitized.get("cr_late_payments", 0) or 0)
+            neg_count  = int(sanitized.get("cr_negative_items", 0) or 0)
+
+            if chargeoffs > 0:
+                # Pivot to charge-off language
+                sanitized["cr_top_collection_name"] = (
+                    f"${int(chargeoffs):,} in charge-offs — those are lawsuit bait"
+                )
+                sanitized["cr_top_collection_amount"] = chargeoffs
+            elif late_count >= 3:
+                sanitized["cr_top_collection_name"] = (
+                    f"{late_count} late payments blocking every approval"
+                )
+                sanitized["cr_top_collection_amount"] = 0
+            elif neg_count > 0:
+                sanitized["cr_top_collection_name"] = (
+                    f"{neg_count} negative items dragging your score down"
+                )
+                sanitized["cr_top_collection_amount"] = 0
+            else:
+                # Nothing bad? Short-circuit — set an honest, non-fearmongering line
+                sanitized["cr_top_collection_name"] = (
+                    "your report is cleaner than most — let's optimize it"
+                )
+                sanitized["cr_top_collection_amount"] = 0
+
+        # ---- Also pre-build a complete, coherent SMS opener ---------------
+        # This can be used as {{custom_values.cr_sms_opener}} in future SMS
+        # templates that want a single intelligent sentence instead of a
+        # mad-libs-style fill-in.
+        first = sanitized.get("cr_full_name") or ""
+        violations = int(sanitized.get("cr_violations_count", 0) or 0)
+        leverage = float(sanitized.get("cr_total_leverage", 0) or 0)
+        top_name_final = sanitized.get("cr_top_collection_name", "")
+        top_amt_final  = float(sanitized.get("cr_top_collection_amount", 0) or 0)
+
+        if top_amt_final > 0 and "charge-off" not in top_name_final.lower() and "late" not in top_name_final.lower() and "negative" not in top_name_final.lower() and "cleaner" not in top_name_final.lower():
+            # It's a real collection
+            opener = (
+                f"That {top_name_final} collection (${top_amt_final:,.0f}) is "
+                f"inside the statute of limitations — they CAN sue you if you "
+                f"don't act. And they do."
+            )
+        elif "cleaner" in top_name_final.lower():
+            opener = (
+                "Good news — no major collections, but I found "
+                f"{violations} technical violations worth about ${leverage:,.0f} "
+                "in leverage you can use."
+            )
+        else:
+            opener = (
+                f"I just analyzed your report — {top_name_final}. "
+                f"Stack that with {violations} federal violations worth "
+                f"~${leverage:,.0f} in leverage and you've got real teeth."
+            )
+        sanitized["cr_sms_opener"] = opener
+
         # Fields that appear in SMS templates — push each
         SMS_RELEVANT = [
             "cr_top_collection_name",
@@ -300,10 +378,11 @@ class GHLClient:
             "cr_top_pain_point",
             "cr_exec_summary",
             "cr_recommended_tier",
+            "cr_sms_opener",
         ]
         for key in SMS_RELEVANT:
-            if key in custom_fields:
-                self.upsert_custom_value(key, custom_fields[key])
+            if key in sanitized:
+                self.upsert_custom_value(key, sanitized[key])
 
 
 # ---- High-level: push an analyzed lead end-to-end ------------------------

@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Scan complete — The Bureau Bullies</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=Space+Grotesk:wght@700&display=swap" rel="stylesheet">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: Inter, system-ui, sans-serif;
+    color: #F2F4F8;
+    background:
+      radial-gradient(900px 600px at 50% 0%, rgba(225,29,46,0.3), transparent 60%),
+      linear-gradient(180deg, #05060a 0%, #07080f 100%);
+    min-height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+    padding: 40px 20px; text-align: center;
+  }
+  .card {
+    max-width: 560px;
+    background: rgba(20,22,30,0.78);
+    backdrop-filter: blur(24px);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 24px;
+    padding: 60px 40px;
+    box-shadow: 0 30px 80px rgba(0,0,0,0.5);
+  }
+  .check {
+    width: 72px; height: 72px; margin: 0 auto 24px;
+    background: linear-gradient(135deg, #E11D2E, #8A0F1C);
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 0 40px rgba(225,29,46,0.5);
+  }
+  h1 {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 34px; font-weight: 700; letter-spacing: -0.025em;
+    margin-bottom: 12px;
+  }
+  p { color: #8D94A3; line-height: 1.6; margin-bottom: 20px; }
+  .next {
+    display: flex; gap: 12px; justify-content: center; margin-top: 32px;
+    flex-wrap: wrap;
+  }
+  .next a {
+    padding: 14px 24px; border-radius: 12px;
+    background: linear-gradient(135deg, #E11D2E, #8A0F1C);
+    color: #fff; text-decoration: none; font-weight: 600;
+    box-shadow: 0 8px 24px rgba(225,29,46,0.4);
+  }
+  .sms-note {
+    margin-top: 28px; padding: 16px;
+    background: rgba(225,29,46,0.08);
+    border: 1px solid rgba(225,29,46,0.2);
+    border-radius: 12px;
+    font-size: 13.5px; color: #c3c8d2;
+  }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="check">
+    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="20 6 9 17 4 12"/>
+    </svg>
+  </div>
+  <h1>Scan complete.</h1>
+  <p>Your report is being broken down right now. We'll text you your top violations and leverage value within the next few minutes.</p>
+  <div class="sms-note">
+    <strong>📱 Check your phone.</strong> The next 3 messages are personalized to YOUR report — don't ignore them.
+  </div>
+  <div class="next">
+    <a href="/">Back to home</a>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,26 @@
+# Render.com Blueprint — one-click deploy
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: bureau-bullies
+    runtime: docker
+    plan: starter                  # $7/mo; upgrade to "standard" for prod
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false                # you fill this in the Render dashboard
+      - key: CLAUDE_MODEL
+        value: claude-sonnet-4-6
+      - key: GHL_API_KEY
+        sync: false
+      - key: GHL_LOCATION_ID
+        sync: false
+      - key: GHL_WORKFLOW_TOOLKIT
+        sync: false
+      - key: GHL_WORKFLOW_ACCELERATOR
+        sync: false
+      - key: GHL_WORKFLOW_DFY
+        sync: false
+      - key: MAX_FILE_MB
+        value: "25"

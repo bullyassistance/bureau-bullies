@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Your Scan Results — Bully AI</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --bg-0: #05060a;
+    --red: #E11D2E;
+    --red-hot: #FF2D40;
+    --red-deep: #8A0F1C;
+    --ink: #F2F4F8;
+    --mute: #8D94A3;
+    --line: rgba(255,255,255,0.08);
+    --glass: rgba(20, 22, 30, 0.78);
+  }
+  html, body {
+    background: var(--bg-0);
+    color: var(--ink);
+    font-family: 'Inter', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    letter-spacing: -0.01em;
+    min-height: 100vh;
+  }
+  .backdrop {
+    position: fixed; inset: 0; z-index: -2;
+    background:
+      radial-gradient(1100px 700px at 50% -5%, rgba(225,29,46,0.4), transparent 60%),
+      radial-gradient(800px 500px at 15% 110%, rgba(225,29,46,0.15), transparent 55%),
+      linear-gradient(180deg, #05060a, #07080f 60%, #05060a);
+  }
+  .grid {
+    position: fixed; inset: 0; z-index: -1; pointer-events: none; opacity: .6;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
+    background-size: 64px 64px;
+    mask-image: radial-gradient(ellipse at 50% 30%, black 40%, transparent 85%);
+  }
+
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 60px 24px 80px; }
+
+  /* Header */
+  .header { text-align: center; margin-bottom: 44px; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 7px 14px; border-radius: 999px;
+    background: rgba(225,29,46,0.12); border: 1px solid rgba(225,29,46,0.35);
+    color: var(--red-hot); font-size: 11.5px; font-weight: 700;
+    letter-spacing: 0.14em; text-transform: uppercase;
+    margin-bottom: 20px;
+  }
+  .badge .pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--red); box-shadow: 0 0 10px var(--red); animation: p 1.4s infinite; }
+  @keyframes p { 0%,100%{opacity:1} 50%{opacity:.4} }
+  h1 {
+    font-size: clamp(34px, 5.5vw, 64px);
+    font-weight: 800; line-height: 1.02; letter-spacing: -0.035em;
+    margin-bottom: 14px;
+  }
+  h1 .red { background: linear-gradient(135deg,#FF3D4E,#8A0F1C); -webkit-background-clip: text; color: transparent; }
+  .sub { color: var(--mute); font-size: 17px; max-width: 620px; margin: 0 auto; line-height: 1.5; }
+
+  /* Leverage hero card */
+  .leverage {
+    margin-top: 36px;
+    background: var(--glass);
+    backdrop-filter: blur(26px);
+    border: 1px solid rgba(225,29,46,0.35);
+    border-radius: 28px;
+    padding: 44px;
+    text-align: center;
+    box-shadow: 0 30px 80px rgba(225,29,46,0.15), 0 0 0 1px rgba(255,255,255,0.03) inset;
+    position: relative; overflow: hidden;
+  }
+  .leverage::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+    background: linear-gradient(90deg, transparent, var(--red-hot), transparent);
+  }
+  .leverage-label {
+    font-size: 13px; color: var(--red-hot); font-weight: 700;
+    letter-spacing: 0.14em; text-transform: uppercase;
+    margin-bottom: 12px;
+  }
+  .leverage-amount {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: clamp(64px, 12vw, 124px);
+    font-weight: 700; line-height: 1; letter-spacing: -0.04em;
+    background: linear-gradient(135deg, #fff 0%, #FF3D4E 60%, #8A0F1C 100%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    margin-bottom: 8px;
+  }
+  .leverage-amount sup { font-size: 0.35em; vertical-align: top; color: var(--red-hot); -webkit-text-fill-color: currentColor; }
+  .leverage-note {
+    color: var(--mute); font-size: 15px; max-width: 580px;
+    margin: 14px auto 0; line-height: 1.5;
+  }
+
+  /* Stat row */
+  .stat-row {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px;
+    margin-top: 32px;
+  }
+  @media (max-width: 720px) { .stat-row { grid-template-columns: 1fr 1fr; } }
+  .stat {
+    background: rgba(255,255,255,0.02); border: 1px solid var(--line);
+    border-radius: 16px; padding: 20px; text-align: left;
+  }
+  .stat-n { font-family: 'Space Grotesk', sans-serif; font-size: 30px; font-weight: 700; letter-spacing: -0.025em; }
+  .stat-l { font-size: 12px; color: var(--mute); text-transform: uppercase; letter-spacing: 0.08em; margin-top: 4px; }
+
+  /* Executive summary */
+  .card {
+    background: var(--glass);
+    backdrop-filter: blur(26px);
+    border: 1px solid var(--line);
+    border-radius: 22px;
+    padding: 32px;
+    margin-top: 28px;
+  }
+  .card-title {
+    font-size: 12px; color: var(--red-hot); font-weight: 700;
+    letter-spacing: 0.14em; text-transform: uppercase; margin-bottom: 12px;
+  }
+  .card-body { font-size: 16.5px; line-height: 1.65; color: #c9ced8; }
+  .card-body strong { color: var(--ink); }
+
+  /* Violations list */
+  .violations { margin-top: 28px; }
+  .vrow {
+    background: var(--glass);
+    backdrop-filter: blur(18px);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--red);
+    border-radius: 14px;
+    padding: 20px 22px;
+    margin-bottom: 12px;
+    display: grid; grid-template-columns: 1fr auto; gap: 20px; align-items: center;
+  }
+  @media (max-width: 620px) { .vrow { grid-template-columns: 1fr; } }
+  .vrow.critical { border-left-color: var(--red-hot); box-shadow: 0 4px 14px rgba(225,29,46,0.15); }
+  .v-creditor { font-weight: 700; font-size: 16px; }
+  .v-type { color: var(--red-hot); font-size: 12.5px; font-weight: 600; margin-top: 4px; }
+  .v-desc { color: var(--mute); font-size: 13.5px; margin-top: 6px; line-height: 1.45; }
+  .v-case { font-size: 12px; color: #a0a8b5; margin-top: 8px; font-style: italic; }
+  .v-lev {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 22px; font-weight: 700;
+    background: linear-gradient(135deg,#FF3D4E,#8A0F1C);
+    -webkit-background-clip: text; color: transparent;
+    white-space: nowrap;
+  }
+  .v-sev {
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.1em;
+    text-transform: uppercase; margin-left: 8px; vertical-align: middle;
+  }
+  .sev-critical { background: var(--red); color: #fff; }
+  .sev-high { background: rgba(225,29,46,0.25); color: var(--red-hot); }
+  .sev-medium { background: rgba(255,255,255,0.08); color: var(--mute); }
+  .sev-low { background: rgba(255,255,255,0.05); color: var(--mute); }
+
+  /* CTA */
+  .cta {
+    margin-top: 44px;
+    background: linear-gradient(135deg, rgba(225,29,46,0.14), rgba(138,15,28,0.08));
+    border: 1px solid rgba(225,29,46,0.45);
+    border-radius: 24px; padding: 44px; text-align: center;
+  }
+  .cta h2 {
+    font-size: clamp(26px, 4vw, 40px);
+    font-weight: 700; letter-spacing: -0.025em; line-height: 1.1;
+    margin-bottom: 10px;
+  }
+  .cta p { color: var(--mute); font-size: 16px; margin-bottom: 28px; }
+  .cta-btn {
+    display: inline-flex; align-items: center; gap: 12px;
+    padding: 20px 40px;
+    background: linear-gradient(135deg, var(--red), var(--red-deep));
+    color: #fff; text-decoration: none; font-weight: 700; font-size: 17px;
+    border-radius: 14px;
+    box-shadow: 0 14px 44px rgba(225,29,46,0.45), inset 0 1px 0 rgba(255,255,255,0.2);
+    transition: transform .2s, box-shadow .2s;
+  }
+  .cta-btn:hover { transform: translateY(-2px); box-shadow: 0 20px 52px rgba(225,29,46,0.7); }
+  .cta-alt {
+    display: inline-block; margin-left: 16px;
+    color: var(--mute); text-decoration: none; font-size: 14px;
+  }
+  .cta-alt:hover { color: var(--ink); }
+  .cta-sub { color: var(--red-hot); font-size: 13px; font-weight: 600; margin-top: 18px; letter-spacing: 0.08em; }
+  .sms-note {
+    margin-top: 28px; padding: 18px;
+    background: rgba(0,0,0,0.35); border-radius: 12px;
+    color: var(--mute); font-size: 14px; line-height: 1.5;
+  }
+  .sms-note strong { color: var(--ink); }
+
+  /* Case law footer */
+  .cases {
+    margin-top: 22px; padding: 22px;
+    background: rgba(0,0,0,0.25); border: 1px dashed rgba(255,255,255,0.08);
+    border-radius: 14px;
+    font-size: 13px; color: var(--mute); line-height: 1.7;
+  }
+  .cases strong { color: var(--ink); }
+</style>
+</head>
+<body>
+<div class="backdrop"></div>
+<div class="grid"></div>
+
+<div class="wrap">
+  <div class="header">
+    <span class="badge"><span class="pulse"></span>Scan complete · Bully AI</span>
+    <h1>Your report is worth<br><span class="red" id="h-leverage">loading…</span></h1>
+    <p class="sub" id="h-sub">Here's exactly what we found. Every violation. Every dollar. Every case law citation that backs it up.</p>
+  </div>
+
+  <!-- Hero leverage card -->
+  <div class="leverage">
+    <div class="leverage-label">Total Estimated Leverage</div>
+    <div class="leverage-amount"><sup>$</sup><span id="leverage">0</span></div>
+    <div class="leverage-note" id="pain-point">
+      That's the combined statutory + actual damages value of the violations sitting on your report right now — under the FCRA, FDCPA, and 15 U.S.C. § 1681s-2(b).
+    </div>
+
+    <div class="stat-row">
+      <div class="stat"><div class="stat-n" id="stat-violations">0</div><div class="stat-l">Violations found</div></div>
+      <div class="stat"><div class="stat-n" id="stat-collections">$0</div><div class="stat-l">In collections</div></div>
+      <div class="stat"><div class="stat-n" id="stat-negatives">0</div><div class="stat-l">Negative items</div></div>
+      <div class="stat"><div class="stat-n" id="stat-fico">—</div><div class="stat-l">FICO range</div></div>
+    </div>
+  </div>
+
+  <!-- Exec summary -->
+  <div class="card">
+    <div class="card-title">Bully AI's Verdict</div>
+    <div class="card-body" id="exec-summary">Loading…</div>
+  </div>
+
+  <!-- Urgency / Fear hooks -->
+  <div class="card">
+    <div class="card-title">Here's why you can't ignore this</div>
+    <div class="card-body">
+      <p id="fear" style="margin-bottom: 10px;">—</p>
+      <p id="urgency" style="color: var(--red-hot); font-weight: 600;">—</p>
+    </div>
+  </div>
+
+  <!-- Violations -->
+  <div class="violations" id="violations"></div>
+
+  <!-- Case law cited -->
+  <div class="cases" id="cases-wrap" style="display:none;">
+    <strong>The federal case law Bully AI just used to back your report:</strong>
+    <div id="cases" style="margin-top: 8px;"></div>
+  </div>
+
+  <!-- CTA -->
+  <div class="cta">
+    <h2 id="cta-h2">Your next move.</h2>
+    <p id="cta-p">Bully AI has already queued your personalized attack plan. Start executing now.</p>
+    <a id="cta-btn" href="#" class="cta-btn">
+      <span id="cta-label">Loading…</span>
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M5 12h14M13 5l7 7-7 7"/></svg>
+    </a>
+    <a id="doc-btn" href="#" class="cta-alt" style="display:none; padding: 20px 28px; background: rgba(255,255,255,0.05); border: 1px solid var(--line); border-radius: 14px; color: var(--ink); font-weight:600; margin-left:12px;">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align:middle; margin-right:6px;"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><polyline points="9 15 12 18 15 15"/></svg>
+      Download Attack Plan (.docx)
+    </a>
+    <a id="cta-alt" href="/" class="cta-alt">See all tiers</a>
+    <div class="cta-sub" id="cta-sub"></div>
+
+    <div class="sms-note">
+      <strong>📱 Watch your phone.</strong>
+      Bully AI is about to start texting you a personalized dispute sequence based on YOUR report. If you don't see a message in the next 5 minutes, check your spam/blocked numbers.
+    </div>
+  </div>
+</div>
+
+<script>
+// Pull the scan summary from sessionStorage (set by index.html on successful upload)
+let data = {};
+let docUrl = null;
+try {
+  const raw = sessionStorage.getItem('bullyScanResult');
+  if (raw) data = JSON.parse(raw);
+  const du = sessionStorage.getItem('bullyDocUrl');
+  if (du) docUrl = du;
+} catch(e) {}
+
+if (docUrl) {
+  const db = document.getElementById('doc-btn');
+  db.style.display = 'inline-flex';
+  db.href = docUrl;
+}
+
+// If no data (e.g. user landed here directly), attempt URL param fallback
+const params = new URLSearchParams(location.search);
+if (!data.total_estimated_leverage && params.get('demo') === '1') {
+  data = {
+    total_estimated_leverage: 14500,
+    total_negative_items: 7,
+    total_collections_value: 8327,
+    estimated_fico_range: '540-580',
+    violations: [
+      {creditor:'Midland Funding LLC', account_last4:'9012', bureau:'Experian', violation_type:'15 U.S.C. § 1681s-2(b)(1)(A) — Rubber-stamp verification', description:'Reporting without original documentation; internal database match only.', dollar_leverage: 1000, severity:'high', case_law_citation:'Hinkle v. Midland Credit Management, 800 F.3d 1295 (11th Cir. 2015)'},
+      {creditor:'Capital One', account_last4:'4532', bureau:'Equifax', violation_type:'Metro 2 — Inconsistent payment history', description:'May 2024 reported as 30-day late on EQ, current on EX.', dollar_leverage: 1500, severity:'critical', case_law_citation:'Saunders v. Branch Banking & Trust, 526 F.3d 142 (4th Cir. 2008)'}
+    ],
+    case_law_cited:['Hinkle v. Midland Credit Management','Saunders v. BB&T'],
+    executive_summary: "You're sitting on 7 negatives worth approximately $14,500 in leverage. The $5,127 Midland collection is a textbook Hinkle violation — they're reporting without original documentation. When they rubber-stamp your dispute (and they will), you have a clean federal case.",
+    top_pain_point: '$5,127 Midland Funding collection destroying your score',
+    fear_hook: "That $5,127 Midland collection from '23 isn't going anywhere — it'll stay 7 more years and shred every future approval.",
+    urgency_hook: 'You have 3 clean § 1681s-2(b) violations on Capital One we can dispute this week — every day you wait, they re-age and your leverage shrinks.',
+    recommended_tier: 'accelerator'
+  };
+}
+
+// Render
+function $(id){ return document.getElementById(id); }
+function money(n){ return (Math.round(n)||0).toLocaleString('en-US'); }
+
+const lev = data.total_estimated_leverage || 0;
+$('leverage').textContent = money(lev);
+$('h-leverage').textContent = '$' + money(lev) + '.';
+if (data.top_pain_point) $('pain-point').textContent = data.top_pain_point;
+$('stat-violations').textContent = data.violations ? data.violations.length : 0;
+$('stat-collections').textContent = '$' + money(data.total_collections_value);
+$('stat-negatives').textContent = data.total_negative_items || 0;
+$('stat-fico').textContent = data.estimated_fico_range || '—';
+$('exec-summary').textContent = data.executive_summary || 'Your report has been scanned. Full details are being sent to your phone now.';
+$('fear').textContent = data.fear_hook || '';
+$('urgency').textContent = data.urgency_hook || '';
+
+// Violations list
+const vwrap = $('violations');
+(data.violations || []).forEach(v => {
+  const row = document.createElement('div');
+  row.className = 'vrow ' + (v.severity === 'critical' ? 'critical' : '');
+  row.innerHTML = `
+    <div>
+      <div class="v-creditor">${v.creditor} <span style="color:var(--mute);font-weight:500;font-size:13px">····${v.account_last4 || ''} · ${v.bureau || ''}</span>
+        <span class="v-sev sev-${v.severity || 'medium'}">${v.severity || ''}</span>
+      </div>
+      <div class="v-type">${v.violation_type || ''}</div>
+      <div class="v-desc">${v.description || ''}</div>
+      ${v.case_law_citation ? '<div class="v-case">Backed by: ' + v.case_law_citation + '</div>' : ''}
+    </div>
+    <div class="v-lev">$${money(v.dollar_leverage)}</div>`;
+  vwrap.appendChild(row);
+});
+
+// Case law footer
+const cases = (data.case_law_cited || []).filter(Boolean);
+if (cases.length) {
+  $('cases-wrap').style.display = 'block';
+  $('cases').innerHTML = cases.map(c => '• ' + c).join('<br>');
+}
+
+// CTA based on recommended tier
+const tier = (data.recommended_tier || 'accelerator').toLowerCase();
+const TIERS = {
+  toolkit: {
+    label: 'Get the Collection Killer — $17',
+    sub: 'Start here. Deploy your first letter in 48 hours.',
+    url: '/checkout?tier=toolkit',
+    h2: 'Start killing that collection for $17.',
+    p: "Bully AI's recommendation for your report — you've got a manageable stack. The Collection Killer ebook walks you through the exact § 1681s-2(b) sequence that's worked for thousands."
+  },
+  accelerator: {
+    label: 'Unlock the Dispute Vault — $66',
+    sub: 'The complete toolkit — every letter, every case, every round.',
+    url: '/checkout?tier=accelerator',
+    h2: "You've got serious leverage. Don't waste it.",
+    p: "Bully AI's recommendation: you've got enough violations that templates aren't enough. The Dispute Vault has the custom letters, the case law reference sheet, and the tracker — everything ready to deploy today."
+  },
+  dfy: {
+    label: 'Apply for DFY — 45% OFF',
+    sub: '$229/mo or $2,500 one-time — regular $4,545.',
+    url: '/checkout?tier=dfy',
+    h2: "Hand it to the squad. We'll sue them with you.",
+    p: "Bully AI's recommendation: your report is a goldmine. With this much leverage, you shouldn't be doing this yourself. Our team handles every dispute, every demand letter, every case file — and we sue violators with you."
+  }
+};
+const t = TIERS[tier] || TIERS.accelerator;
+$('cta-label').textContent = t.label;
+$('cta-btn').href = t.url;
+$('cta-sub').textContent = t.sub;
+$('cta-h2').textContent = t.h2;
+$('cta-p').textContent = t.p;
+</script>
+</body>
+</html>

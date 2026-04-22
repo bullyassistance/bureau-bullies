@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>The Bureau Bullies — Powered by Bully AI</title>
+<meta name="description" content="Bully AI is the most advanced credit-intelligence agent on the planet. Upload your 3-bureau report. We find the violations. We write the letters. We demolish the debt." />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --bg-0: #05060a;
+    --bg-1: #0b0d14;
+    --red:  #E11D2E;
+    --red-hot: #FF2D40;
+    --red-deep: #8A0F1C;
+    --ink:  #F2F4F8;
+    --mute: #8D94A3;
+    --line: rgba(255,255,255,0.08);
+    --glass: rgba(20, 22, 30, 0.55);
+    --glass-strong: rgba(20, 22, 30, 0.78);
+  }
+  html { scroll-behavior: smooth; }
+  html, body {
+    background: var(--bg-0);
+    color: var(--ink);
+    font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    font-weight: 400;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+    letter-spacing: -0.01em;
+  }
+  ::selection { background: var(--red); color: #fff; }
+
+  /* ------- Backdrop: cinematic gradient + noise + subtle grid ------- */
+  .backdrop {
+    position: fixed; inset: 0; z-index: -2;
+    background:
+      radial-gradient(1200px 700px at 78% -10%, rgba(225,29,46,0.35), transparent 60%),
+      radial-gradient(900px 600px at 10% 110%, rgba(225,29,46,0.18), transparent 55%),
+      linear-gradient(180deg, #05060a 0%, #07080f 50%, #05060a 100%);
+  }
+  .grid-overlay {
+    position: fixed; inset: 0; z-index: -1; pointer-events: none;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.035) 1px, transparent 1px);
+    background-size: 64px 64px;
+    mask-image: radial-gradient(ellipse at 50% 40%, black 40%, transparent 85%);
+  }
+  .noise {
+    position: fixed; inset: 0; z-index: -1; pointer-events: none; opacity: .045;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  }
+
+  /* ------- Nav ------- */
+  nav {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 50;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 40px;
+    backdrop-filter: blur(16px) saturate(140%);
+    -webkit-backdrop-filter: blur(16px) saturate(140%);
+    background: rgba(5,6,10,0.55);
+    border-bottom: 1px solid var(--line);
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand-mark {
+    width: 34px; height: 34px;
+    filter: drop-shadow(0 0 12px rgba(225,29,46,0.55));
+  }
+  .brand-text {
+    font-family: 'Space Grotesk', sans-serif;
+    font-weight: 700; font-size: 16px; letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .brand-text span { color: var(--red); }
+  .nav-links { display: flex; gap: 32px; font-size: 13.5px; font-weight: 500; color: var(--mute); }
+  .nav-links a { color: var(--mute); text-decoration: none; transition: color .2s; }
+  .nav-links a:hover { color: var(--ink); }
+  .nav-cta {
+    padding: 10px 20px; border-radius: 999px;
+    background: linear-gradient(135deg, var(--red) 0%, var(--red-deep) 100%);
+    color: #fff; font-weight: 600; font-size: 13.5px; text-decoration: none;
+    box-shadow: 0 0 24px rgba(225,29,46,0.45);
+    transition: transform .2s, box-shadow .2s;
+  }
+  .nav-cta:hover { transform: translateY(-1px); box-shadow: 0 0 36px rgba(225,29,46,0.7); }
+  @media (max-width: 768px) { .nav-links { display: none; } nav { padding: 14px 20px; } }
+
+  /* ------- Hero ------- */
+  .hero {
+    min-height: 100vh;
+    display: grid;
+    grid-template-columns: 1.1fr 0.9fr;
+    align-items: center;
+    padding: 140px 80px 80px;
+    gap: 60px;
+    position: relative;
+  }
+  @media (max-width: 1024px) {
+    .hero { grid-template-columns: 1fr; padding: 120px 24px 60px; gap: 20px; }
+  }
+  .hero-copy { max-width: 640px; }
+  .eyebrow {
+    display: inline-flex; align-items: center; gap: 10px;
+    padding: 6px 14px; border-radius: 999px;
+    background: rgba(225,29,46,0.08); border: 1px solid rgba(225,29,46,0.25);
+    color: var(--red-hot); font-size: 12px; font-weight: 600;
+    letter-spacing: 0.12em; text-transform: uppercase;
+    margin-bottom: 28px;
+  }
+  .eyebrow .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--red); box-shadow: 0 0 10px var(--red); animation: pulse 1.6s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+
+  h1 {
+    font-family: 'Inter', sans-serif;
+    font-weight: 800;
+    font-size: clamp(44px, 6vw, 84px);
+    line-height: 0.96;
+    letter-spacing: -0.035em;
+    margin-bottom: 24px;
+  }
+  h1 .red {
+    background: linear-gradient(135deg, #FF3D4E 0%, #E11D2E 50%, #8A0F1C 100%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  h1 .slash {
+    display: inline-block; transform: skewX(-12deg);
+    color: var(--red);
+  }
+  .lede {
+    font-size: 19px; line-height: 1.55; color: var(--mute);
+    margin-bottom: 40px; max-width: 540px;
+  }
+  .lede b { color: var(--ink); font-weight: 600; }
+
+  .cta-row { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+  .btn-primary {
+    padding: 18px 34px; border-radius: 14px;
+    background: linear-gradient(135deg, var(--red) 0%, var(--red-deep) 100%);
+    color: #fff; font-weight: 600; font-size: 15px; text-decoration: none;
+    border: 1px solid rgba(255,61,78,0.6);
+    box-shadow: 0 12px 40px rgba(225,29,46,0.45), inset 0 1px 0 rgba(255,255,255,0.18);
+    cursor: pointer;
+    transition: transform .2s, box-shadow .2s;
+    display: inline-flex; align-items: center; gap: 10px;
+  }
+  .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 18px 50px rgba(225,29,46,0.7); }
+  .btn-ghost {
+    padding: 18px 28px; border-radius: 14px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--line);
+    color: var(--ink); font-weight: 500; font-size: 15px; text-decoration: none;
+    cursor: pointer; transition: background .2s;
+  }
+  .btn-ghost:hover { background: rgba(255,255,255,0.08); }
+
+  .stats {
+    display: flex; gap: 48px; margin-top: 56px;
+    padding-top: 32px; border-top: 1px solid var(--line);
+    max-width: 600px; flex-wrap: wrap;
+  }
+  .stat-num { font-family: 'Space Grotesk', sans-serif; font-size: 28px; font-weight: 700; color: var(--ink); letter-spacing: -0.02em; }
+  .stat-label { font-size: 12px; color: var(--mute); text-transform: uppercase; letter-spacing: 0.08em; margin-top: 4px; }
+
+  /* ------- Hero right: 3D shield + glass orb ------- */
+  .hero-visual {
+    position: relative;
+    height: 600px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #three-canvas {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+  }
+  .orbit-ring {
+    position: absolute; width: 440px; height: 440px; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    border: 1px solid rgba(225,29,46,0.22);
+    border-radius: 50%;
+    box-shadow: 0 0 80px rgba(225,29,46,0.12) inset;
+    pointer-events: none;
+  }
+  .orbit-ring::before, .orbit-ring::after {
+    content: ''; position: absolute; border-radius: 50%;
+    border: 1px solid rgba(255,255,255,0.04);
+  }
+  .orbit-ring::before { inset: -40px; }
+  .orbit-ring::after  { inset: -90px; border-color: rgba(255,255,255,0.03); }
+
+  /* ------- Upload module ------- */
+  .upload-section {
+    padding: 100px 80px;
+    display: flex; justify-content: center;
+    position: relative;
+  }
+  @media (max-width: 768px) { .upload-section { padding: 60px 20px; } }
+
+  .upload-card {
+    width: 100%; max-width: 780px;
+    background: var(--glass-strong);
+    backdrop-filter: blur(28px) saturate(140%);
+    -webkit-backdrop-filter: blur(28px) saturate(140%);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 28px;
+    padding: 48px;
+    box-shadow:
+      0 30px 80px rgba(0,0,0,0.5),
+      0 0 0 1px rgba(255,255,255,0.02) inset,
+      0 1px 0 rgba(255,255,255,0.06) inset;
+    position: relative; overflow: hidden;
+  }
+  .upload-card::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(225,29,46,0.6), transparent);
+  }
+  .upload-title {
+    font-size: 14px; font-weight: 600; color: var(--red-hot);
+    text-transform: uppercase; letter-spacing: 0.14em;
+    margin-bottom: 14px;
+  }
+  .upload-heading {
+    font-size: clamp(28px, 3.5vw, 42px); font-weight: 700;
+    line-height: 1.1; letter-spacing: -0.025em;
+    margin-bottom: 14px;
+  }
+  .upload-sub { color: var(--mute); font-size: 16px; line-height: 1.55; margin-bottom: 32px; }
+  .upload-sub a { color: var(--red-hot); text-decoration: none; border-bottom: 1px dashed rgba(225,29,46,0.5); }
+
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 18px; }
+  @media (max-width: 640px) { .form-grid { grid-template-columns: 1fr; } }
+
+  .field label {
+    display: block; font-size: 12px; font-weight: 600; color: var(--mute);
+    text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px;
+  }
+  .field input, .field select {
+    width: 100%; padding: 14px 16px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    color: var(--ink); font-size: 15px; font-family: inherit;
+    transition: border-color .2s, background .2s;
+  }
+  .field input:focus, .field select:focus {
+    outline: none; border-color: var(--red);
+    background: rgba(255,255,255,0.05);
+    box-shadow: 0 0 0 4px rgba(225,29,46,0.15);
+  }
+  .field input::placeholder { color: #51596b; }
+
+  /* Drop zone */
+  .drop {
+    margin: 22px 0 18px;
+    border: 2px dashed rgba(225,29,46,0.35);
+    border-radius: 16px;
+    padding: 38px 24px;
+    text-align: center;
+    background: rgba(225,29,46,0.035);
+    transition: background .2s, border-color .2s, transform .2s;
+    cursor: pointer;
+  }
+  .drop:hover, .drop.drag {
+    border-color: var(--red-hot);
+    background: rgba(225,29,46,0.08);
+    transform: translateY(-1px);
+  }
+  .drop-icon {
+    width: 52px; height: 52px; margin: 0 auto 14px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, rgba(225,29,46,0.25), rgba(225,29,46,0.05));
+    border: 1px solid rgba(225,29,46,0.35);
+    display: flex; align-items: center; justify-content: center;
+    color: var(--red-hot);
+  }
+  .drop-text { font-weight: 600; font-size: 15px; }
+  .drop-hint { color: var(--mute); font-size: 13px; margin-top: 6px; }
+  .drop-files { margin-top: 14px; font-size: 13px; color: var(--red-hot); }
+
+  .consent {
+    display: flex; align-items: flex-start; gap: 12px;
+    margin: 20px 0 24px;
+    font-size: 13px; color: var(--mute); line-height: 1.5;
+  }
+  .consent input[type=checkbox] {
+    appearance: none; -webkit-appearance: none;
+    width: 18px; height: 18px; border-radius: 5px;
+    border: 1.5px solid rgba(255,255,255,0.2);
+    background: rgba(255,255,255,0.03);
+    cursor: pointer; flex-shrink: 0; margin-top: 2px;
+    position: relative; transition: all .15s;
+  }
+  .consent input[type=checkbox]:checked {
+    background: var(--red); border-color: var(--red);
+  }
+  .consent input[type=checkbox]:checked::after {
+    content: ''; position: absolute; left: 5px; top: 1px;
+    width: 5px; height: 10px; border: solid white;
+    border-width: 0 2px 2px 0; transform: rotate(45deg);
+  }
+  .consent a { color: var(--ink); }
+
+  .submit-btn {
+    width: 100%; padding: 18px;
+    background: linear-gradient(135deg, var(--red) 0%, var(--red-deep) 100%);
+    color: #fff; border: none; border-radius: 14px;
+    font-size: 16px; font-weight: 700; letter-spacing: 0.01em;
+    cursor: pointer;
+    box-shadow: 0 14px 44px rgba(225,29,46,0.45), inset 0 1px 0 rgba(255,255,255,0.2);
+    transition: transform .15s, box-shadow .15s, opacity .15s;
+    position: relative; overflow: hidden;
+  }
+  .submit-btn:hover:not(:disabled) {
+    transform: translateY(-2px);
+    box-shadow: 0 20px 52px rgba(225,29,46,0.7);
+  }
+  .submit-btn:disabled { opacity: .5; cursor: not-allowed; }
+  .submit-btn::after {
+    content: ''; position: absolute; top: 0; left: -100%; width: 60%; height: 100%;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.25), transparent);
+    transition: left .6s;
+  }
+  .submit-btn:hover::after { left: 120%; }
+
+  .trust-row {
+    display: flex; justify-content: center; gap: 28px; margin-top: 22px;
+    font-size: 12px; color: var(--mute); flex-wrap: wrap;
+  }
+  .trust-row span { display: inline-flex; align-items: center; gap: 6px; }
+  .trust-row svg { color: var(--red-hot); }
+
+  /* ------- Features strip ------- */
+  .features {
+    padding: 100px 80px;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 24px;
+  }
+  @media (max-width: 1024px) { .features { grid-template-columns: 1fr; padding: 60px 24px; } }
+  .feature {
+    background: var(--glass);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--line);
+    border-radius: 22px;
+    padding: 34px;
+    transition: transform .25s, border-color .25s;
+  }
+  .feature:hover { transform: translateY(-4px); border-color: rgba(225,29,46,0.4); }
+  .feat-num {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 12px; font-weight: 700; color: var(--red-hot);
+    letter-spacing: 0.14em;
+  }
+  .feat-title { font-size: 22px; font-weight: 700; margin: 12px 0 10px; letter-spacing: -0.02em; }
+  .feat-body { color: var(--mute); font-size: 14.5px; line-height: 1.55; }
+
+  /* ------- Process ------- */
+  .process {
+    padding: 100px 80px;
+    text-align: center;
+  }
+  @media (max-width: 768px) { .process { padding: 60px 24px; } }
+  .section-eyebrow {
+    font-size: 12px; font-weight: 600; color: var(--red-hot);
+    text-transform: uppercase; letter-spacing: 0.14em;
+  }
+  .section-title {
+    font-size: clamp(32px, 4.5vw, 54px); font-weight: 700;
+    margin: 12px 0 60px; letter-spacing: -0.03em; line-height: 1.05;
+  }
+  .process-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    gap: 16px; max-width: 1200px; margin: 0 auto;
+  }
+  @media (max-width: 900px) { .process-grid { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 540px) { .process-grid { grid-template-columns: 1fr; } }
+  .step {
+    background: var(--glass);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid var(--line);
+    border-radius: 20px; padding: 28px 22px;
+    text-align: left;
+  }
+  .step-n {
+    font-family: 'Space Grotesk', sans-serif; font-size: 44px; font-weight: 700;
+    background: linear-gradient(135deg, #FF3D4E, #8A0F1C);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    line-height: 1;
+  }
+  .step h4 { font-size: 17px; font-weight: 700; margin: 14px 0 8px; }
+  .step p { color: var(--mute); font-size: 13.5px; line-height: 1.5; }
+
+  /* ------- Pricing ------- */
+  .pricing {
+    padding: 100px 80px 120px;
+    text-align: center;
+  }
+  @media (max-width: 768px) { .pricing { padding: 60px 24px; } }
+  .price-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr);
+    gap: 20px; max-width: 1100px; margin: 0 auto;
+  }
+  @media (max-width: 900px) { .price-grid { grid-template-columns: 1fr; } }
+  .price {
+    background: var(--glass-strong);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    border: 1px solid var(--line);
+    border-radius: 24px; padding: 36px 30px;
+    text-align: left; position: relative; overflow: hidden;
+  }
+  .price.featured {
+    border-color: rgba(225,29,46,0.5);
+    box-shadow: 0 20px 60px rgba(225,29,46,0.2);
+    transform: translateY(-8px);
+  }
+  .price-badge {
+    position: absolute; top: 18px; right: 18px;
+    padding: 4px 10px; font-size: 10px; font-weight: 700;
+    letter-spacing: 0.1em; text-transform: uppercase;
+    background: var(--red); color: #fff; border-radius: 999px;
+  }
+  .price-name { font-size: 13px; color: var(--red-hot); font-weight: 600; text-transform: uppercase; letter-spacing: 0.12em; }
+  .price-amount { font-family: 'Space Grotesk', sans-serif; font-size: 56px; font-weight: 700; margin: 12px 0 4px; letter-spacing: -0.03em; }
+  .price-amount sup { font-size: 22px; vertical-align: top; color: var(--mute); }
+  .price-desc { color: var(--mute); font-size: 14px; margin-bottom: 22px; line-height: 1.5; }
+  .price ul { list-style: none; margin-bottom: 26px; }
+  .price li { padding: 8px 0; font-size: 14px; color: #c3c8d2; display: flex; gap: 10px; align-items: flex-start; }
+  .price li::before { content: '▸'; color: var(--red-hot); flex-shrink: 0; }
+  .price button {
+    width: 100%; padding: 14px; border-radius: 12px; font-weight: 600;
+    font-size: 14px; cursor: pointer; border: none; transition: all .2s;
+  }
+  .price.featured button {
+    background: linear-gradient(135deg, var(--red), var(--red-deep));
+    color: #fff;
+    box-shadow: 0 10px 30px rgba(225,29,46,0.4);
+  }
+  .price:not(.featured) button {
+    background: rgba(255,255,255,0.05);
+    color: var(--ink);
+    border: 1px solid var(--line);
+  }
+  .price button:hover { transform: translateY(-2px); }
+
+  /* ------- Footer ------- */
+  footer {
+    padding: 40px 80px;
+    border-top: 1px solid var(--line);
+    color: var(--mute); font-size: 12.5px;
+    display: flex; justify-content: space-between; flex-wrap: wrap; gap: 20px;
+  }
+  footer a { color: var(--mute); text-decoration: none; margin-left: 20px; }
+  footer a:hover { color: var(--ink); }
+  @media (max-width: 640px) { footer { padding: 24px 20px; flex-direction: column; } }
+
+  /* ------- Modal (processing) ------- */
+  .modal-backdrop {
+    position: fixed; inset: 0; z-index: 200; display: none;
+    background: rgba(0,0,0,0.7); backdrop-filter: blur(8px);
+    align-items: center; justify-content: center;
+  }
+  .modal-backdrop.open { display: flex; }
+  .modal {
+    width: 90%; max-width: 480px;
+    background: var(--glass-strong); backdrop-filter: blur(30px);
+    border: 1px solid var(--line); border-radius: 22px;
+    padding: 40px; text-align: center;
+  }
+  .spinner {
+    width: 52px; height: 52px; margin: 0 auto 20px;
+    border: 3px solid rgba(225,29,46,0.2);
+    border-top-color: var(--red);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .modal h3 { font-size: 22px; margin-bottom: 8px; }
+  .modal p { color: var(--mute); font-size: 14px; line-height: 1.5; }
+  .progress-text { font-size: 13px; color: var(--red-hot); margin-top: 14px; font-weight: 500; min-height: 20px; }
+
+  /* ------- Fade-in animations ------- */
+  [data-reveal] { opacity: 0; transform: translateY(20px); transition: opacity .7s, transform .7s; }
+  [data-reveal].in { opacity: 1; transform: translateY(0); }
+</style>
+</head>
+<body>
+
+<div class="backdrop"></div>
+<div class="grid-overlay"></div>
+<div class="noise"></div>
+
+<!-- NAV -->
+<nav>
+  <div class="brand">
+    <svg class="brand-mark" viewBox="0 0 64 72" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="shield-grad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#FF3D4E"/>
+          <stop offset="100%" stop-color="#8A0F1C"/>
+        </linearGradient>
+      </defs>
+      <path d="M32 2 L60 12 V36 C60 52 48 64 32 70 C16 64 4 52 4 36 V12 Z" fill="url(#shield-grad)" stroke="#FF3D4E" stroke-width="1.5"/>
+      <path d="M40 22 A14 14 0 1 0 40 50 A11 11 0 1 1 40 22 Z" fill="#0a0b10"/>
+      <circle cx="46" cy="27" r="2.2" fill="#fff"/>
+    </svg>
+    <div class="brand-text">BUREAU<span>BULLIES</span></div>
+  </div>
+  <div class="nav-links">
+    <a href="#how">How it works</a>
+    <a href="#pricing">Pricing</a>
+    <a href="#upload">Start</a>
+  </div>
+  <a href="#upload" class="nav-cta">Scan My Report</a>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="hero-copy" data-reveal>
+    <div class="eyebrow"><span class="dot"></span>Powered by Bully AI · Live Scan</div>
+    <h1>
+      We don't<br>
+      <span class="red">negotiate</span><br>
+      with <span class="slash">bureaus.</span>
+    </h1>
+    <p class="lede">
+      The Bureau Bullies is an AI credit assassin. Upload your 3-bureau report — <b>Bully AI</b> reads every tradeline, <b>hunts FCRA, FDCPA, and Metro&nbsp;2 violations</b>, and builds a surgical dispute plan in under 60 seconds.
+    </p>
+    <div class="cta-row">
+      <a href="#upload" class="btn-primary">
+        Scan My Report — Free
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M5 12h14M13 5l7 7-7 7"/></svg>
+      </a>
+    </div>
+    <div class="stats">
+      <div><div class="stat-num">147K+</div><div class="stat-label">Violations flagged</div></div>
+      <div><div class="stat-num">$38M</div><div class="stat-label">Debt challenged</div></div>
+      <div><div class="stat-num">62 sec</div><div class="stat-label">Avg. scan time</div></div>
+    </div>
+  </div>
+  <div class="hero-visual">
+    <div class="orbit-ring"></div>
+    <canvas id="three-canvas"></canvas>
+  </div>
+</section>
+
+<!-- UPLOAD -->
+<section class="upload-section" id="upload">
+  <div class="upload-card" data-reveal>
+    <div class="upload-title">Step 01 · Free Scan</div>
+    <h2 class="upload-heading">Upload your 3-bureau credit report.</h2>
+    <p class="upload-sub">
+      Don't have one? Pull a fresh one at <a href="https://www.annualcreditreport.com" target="_blank" rel="noopener">annualcreditreport.com</a> — it's free and federally guaranteed. Download PDFs from all 3 bureaus (Experian, Equifax, TransUnion) and drop them below.
+    </p>
+
+    <form id="lead-form" autocomplete="on">
+      <div class="form-grid">
+        <div class="field">
+          <label for="fname">First name</label>
+          <input id="fname" name="firstName" placeholder="Marcus" required />
+        </div>
+        <div class="field">
+          <label for="lname">Last name</label>
+          <input id="lname" name="lastName" placeholder="Harris" required />
+        </div>
+        <div class="field">
+          <label for="email">Email</label>
+          <input id="email" name="email" type="email" placeholder="you@email.com" required />
+        </div>
+        <div class="field">
+          <label for="phone">Mobile number</label>
+          <input id="phone" name="phone" type="tel" placeholder="(555) 000-0000" required />
+        </div>
+      </div>
+
+      <label for="report-input" class="drop" id="drop-zone">
+        <div class="drop-icon">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        </div>
+        <div class="drop-text">Drop your reports here</div>
+        <div class="drop-hint">PDFs, screenshots, or phone photos · up to 25 MB each · all 3 bureaus ideal</div>
+        <div class="drop-files" id="file-list"></div>
+        <input id="report-input" type="file" name="reports" multiple accept="application/pdf,image/png,image/jpeg,image/jpg,image/webp" style="display:none" required />
+      </label>
+
+      <label class="consent">
+        <input type="checkbox" id="tos" required />
+        <span>
+          I have read and agree to the <a href="/terms" target="_blank">Terms of Service</a> and <a href="/privacy" target="_blank">Privacy Policy</a>. I voluntarily and knowingly provide my credit information to The Bureau Bullies, LLC (Wilmington, DE) and release it from any and all liability arising from its use. I waive my right to any class action, and agree that any dispute will be resolved by binding arbitration in Delaware. I consent to receive SMS + email marketing. Msg & data rates apply. Reply STOP to cancel.
+        </span>
+      </label>
+
+      <button type="submit" class="submit-btn" id="submit-btn">
+        Start My AI Scan →
+      </button>
+
+      <div class="trust-row">
+        <span><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg> Bank-level encryption</span>
+        <span><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg> FCRA compliant</span>
+        <span><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg> Reports never sold</span>
+      </div>
+    </form>
+  </div>
+</section>
+
+<!-- PROCESS -->
+<section class="process" id="how">
+  <div class="section-eyebrow">The System</div>
+  <h2 class="section-title">Four steps. Zero mercy.</h2>
+  <div class="process-grid">
+    <div class="step" data-reveal>
+      <div class="step-n">01</div>
+      <h4>Upload</h4>
+      <p>Drop your 3-bureau PDFs. Annualcreditreport.com, SmartCredit, or IdentityIQ — we read them all.</p>
+    </div>
+    <div class="step" data-reveal>
+      <div class="step-n">02</div>
+      <h4>AI Deep-Dive</h4>
+      <p>Bully AI scans every tradeline, collection, inquiry, and public record — flagging FCRA, FDCPA, and Metro 2 violations line by line.</p>
+    </div>
+    <div class="step" data-reveal>
+      <div class="step-n">03</div>
+      <h4>Strategy Drop</h4>
+      <p>You get a custom attack plan: what to dispute first, what each violation is worth, and the exact leverage you're sitting on.</p>
+    </div>
+    <div class="step" data-reveal>
+      <div class="step-n">04</div>
+      <h4>Execute</h4>
+      <p>Run it yourself with our $17 toolkit, let us co-pilot at $66, or hand it off DFY and watch the bureaus cave.</p>
+    </div>
+  </div>
+</section>
+
+<!-- FEATURES -->
+<section class="features">
+  <div class="feature" data-reveal>
+    <div class="feat-num">01 / AI ENGINE</div>
+    <div class="feat-title">Bully AI is not a template bot.</div>
+    <div class="feat-body">Our proprietary Bully AI engine was trained on thousands of successful disputes and the latest FCRA, FDCPA, and Metro 2 case law. It thinks like a credit attorney, not a chatbot.</div>
+  </div>
+  <div class="feature" data-reveal>
+    <div class="feat-num">02 / PRECISION</div>
+    <div class="feat-title">Violation-level specificity.</div>
+    <div class="feat-body">"Late payment on the Capital One $420 balance, reported inconsistently across Equifax and TransUnion — Metro 2 violation, ~$1,000 settlement leverage."</div>
+  </div>
+  <div class="feature" data-reveal>
+    <div class="feat-num">03 / MOMENTUM</div>
+    <div class="feat-title">Your $5K collection won't fix itself.</div>
+    <div class="feat-body">We don't just scan. We keep you moving — daily nudges, tailored to <em>your</em> report, until the negative items are gone.</div>
+  </div>
+</section>
+
+<!-- PRICING -->
+<section class="pricing" id="pricing">
+  <div class="section-eyebrow">Your Arsenal</div>
+  <h2 class="section-title">Three tiers. Total domination.</h2>
+  <div class="price-grid">
+    <div class="price" data-reveal>
+      <div class="price-name">Collection Killer</div>
+      <div class="price-amount"><sup>$</sup>17</div>
+      <p class="price-desc">The self-served starter kit. Your AI scan + the exact playbook we use to delete collections.</p>
+      <ul>
+        <li>Full Bully AI report scan</li>
+        <li>Violation hit-list</li>
+        <li>The Collection Killer ebook</li>
+        <li>Proven dispute letter templates</li>
+      </ul>
+      <button onclick="location.href='#upload'">Get the Killer — $17</button>
+    </div>
+    <div class="price featured" data-reveal>
+      <div class="price-badge">Most Popular</div>
+      <div class="price-name">Dispute Vault</div>
+      <div class="price-amount"><sup>$</sup>66</div>
+      <p class="price-desc">The complete toolkit. Every letter, every law, every round — custom to your report.</p>
+      <ul>
+        <li>Everything in Collection Killer</li>
+        <li>The Dispute Vault — complete toolkit</li>
+        <li>Custom letters for every violation</li>
+        <li>Round 1–4 escalation sequence</li>
+        <li>Metro 2, FCRA, FDCPA cheat sheets</li>
+        <li>Priority SMS support</li>
+      </ul>
+      <button onclick="location.href='#upload'">Unlock the Vault — $66</button>
+    </div>
+    <div class="price" data-reveal>
+      <div class="price-badge" style="background: linear-gradient(135deg,#FF3D4E,#8A0F1C)">45% OFF</div>
+      <div class="price-name">Done-For-You · Bullies Squad</div>
+      <div class="price-amount"><sup>$</sup>229<span style="font-size:18px;color:var(--mute);font-weight:500">/mo</span></div>
+      <p class="price-desc">Or <b>$2,500 one-time</b> (reg. $4,545). Hand it off — our squad + Bully AI work your file until it's clean and we sue violators with you.</p>
+      <ul>
+        <li>Everything in Dispute Vault</li>
+        <li>Full service — we do the work</li>
+        <li>Direct bureau + creditor attacks</li>
+        <li>We sue violators <em>with</em> you</li>
+        <li>Dedicated credit strategist</li>
+        <li>Results guarantee</li>
+      </ul>
+      <button onclick="location.href='#upload'">Apply for DFY</button>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div>© 2026 The Bureau Bullies · Financial Freedom · Justice · Equality</div>
+  <div>
+    <a href="/terms">Terms</a>
+    <a href="/privacy">Privacy</a>
+    <a href="/disclaimer">Disclaimer</a>
+  </div>
+</footer>
+
+<!-- PROCESSING MODAL -->
+<div class="modal-backdrop" id="modal">
+  <div class="modal">
+    <div class="spinner"></div>
+    <h3>Scanning your report…</h3>
+    <p>Bully AI is reading every tradeline and hunting violations. This takes 30–90 seconds.</p>
+    <div class="progress-text" id="progress-text">Extracting text from PDFs…</div>
+  </div>
+</div>
+
+<script>
+/* ---------- Three.js: floating 3D shield ---------- */
+(function init3D(){
+  const canvas = document.getElementById('three-canvas');
+  if (!canvas || !window.THREE) return;
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+  camera.position.set(0, 0, 6.5);
+
+  const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+  function resize() {
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
+  resize(); window.addEventListener('resize', resize);
+
+  // Lights
+  scene.add(new THREE.AmbientLight(0x1a1a2a, 0.6));
+  const key = new THREE.PointLight(0xff2d40, 2.8, 30); key.position.set(4, 4, 4); scene.add(key);
+  const fill = new THREE.PointLight(0xffffff, 0.6, 20); fill.position.set(-4, -3, 3); scene.add(fill);
+  const rim = new THREE.PointLight(0xff6b7a, 1.5, 20); rim.position.set(0, 0, -4); scene.add(rim);
+
+  // Build shield geometry from extruded 2D path (shape matching logo)
+  const shape = new THREE.Shape();
+  shape.moveTo(0, 1.9);
+  shape.lineTo(1.4, 1.45);
+  shape.lineTo(1.4, -0.15);
+  shape.bezierCurveTo(1.4, 1.0-1.1, 0.85, -1.3, 0, -1.7);
+  shape.bezierCurveTo(-0.85, -1.3, -1.4, -0.1, -1.4, -0.15);
+  shape.lineTo(-1.4, 1.45);
+  shape.closePath();
+
+  const extrude = { depth: 0.28, bevelEnabled: true, bevelThickness: 0.08, bevelSize: 0.06, bevelSegments: 6, steps: 1 };
+  const geo = new THREE.ExtrudeGeometry(shape, extrude);
+  geo.center();
+
+  const mat = new THREE.MeshPhysicalMaterial({
+    color: 0xE11D2E, metalness: 0.9, roughness: 0.22,
+    clearcoat: 1.0, clearcoatRoughness: 0.15,
+    reflectivity: 0.9, emissive: 0x3a0810, emissiveIntensity: 0.35
+  });
+  const shield = new THREE.Mesh(geo, mat);
+  shield.scale.set(1.25, 1.25, 1.25);
+  scene.add(shield);
+
+  // Inner crescent (decorative)
+  const ringGeo = new THREE.TorusGeometry(0.55, 0.06, 16, 80, Math.PI * 1.35);
+  const ringMat = new THREE.MeshStandardMaterial({ color: 0xffffff, metalness: 0.9, roughness: 0.3, emissive: 0x220000 });
+  const ring = new THREE.Mesh(ringGeo, ringMat);
+  ring.position.z = 0.2; ring.rotation.z = -0.4;
+  shield.add(ring);
+
+  // Subtle particle dust
+  const dustGeo = new THREE.BufferGeometry();
+  const count = 220;
+  const pos = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) {
+    pos[i*3] = (Math.random() - 0.5) * 10;
+    pos[i*3+1] = (Math.random() - 0.5) * 6;
+    pos[i*3+2] = (Math.random() - 0.5) * 6;
+  }
+  dustGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  const dustMat = new THREE.PointsMaterial({ color: 0xff3d4e, size: 0.025, transparent: true, opacity: 0.5 });
+  scene.add(new THREE.Points(dustGeo, dustMat));
+
+  // Mouse parallax
+  let mx = 0, my = 0;
+  window.addEventListener('mousemove', e => {
+    mx = (e.clientX / window.innerWidth - 0.5) * 0.4;
+    my = (e.clientY / window.innerHeight - 0.5) * 0.4;
+  });
+
+  let t = 0;
+  function animate(){
+    t += 0.01;
+    shield.rotation.y = Math.sin(t * 0.7) * 0.45 + mx;
+    shield.rotation.x = Math.sin(t * 0.5) * 0.15 + my;
+    shield.position.y = Math.sin(t * 0.8) * 0.1;
+    renderer.render(scene, camera);
+    requestAnimationFrame(animate);
+  }
+  animate();
+})();
+
+/* ---------- Upload drop-zone ---------- */
+const drop = document.getElementById('drop-zone');
+const input = document.getElementById('report-input');
+const fileList = document.getElementById('file-list');
+
+['dragenter','dragover'].forEach(ev =>
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('drag'); }));
+['dragleave','drop'].forEach(ev =>
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('drag'); }));
+drop.addEventListener('drop', e => {
+  input.files = e.dataTransfer.files;
+  renderFiles();
+});
+input.addEventListener('change', renderFiles);
+function renderFiles(){
+  if (!input.files.length) { fileList.textContent = ''; return; }
+  fileList.textContent = Array.from(input.files).map(f => f.name).join(' · ');
+}
+
+/* ---------- Fade-in reveal ---------- */
+const io = new IntersectionObserver((entries) => {
+  entries.forEach(e => { if (e.isIntersecting) e.target.classList.add('in'); });
+}, { threshold: 0.12 });
+document.querySelectorAll('[data-reveal]').forEach(el => io.observe(el));
+
+/* ---------- Form submit ---------- */
+const form = document.getElementById('lead-form');
+const modal = document.getElementById('modal');
+const progress = document.getElementById('progress-text');
+
+const PROGRESS_STEPS = [
+  'Extracting text from your report…',
+  'Parsing tradelines and collections…',
+  'Identifying inquiries and public records…',
+  'Bully AI is deep-diving your report…',
+  'Hunting FCRA and FDCPA violations…',
+  'Cross-referencing Metro 2 compliance…',
+  'Calculating settlement leverage…',
+  'Finalizing your custom attack plan…'
+];
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (!document.getElementById('tos').checked) {
+    alert('Please agree to the Terms of Service to continue.');
+    return;
+  }
+  if (input.files.length === 0) {
+    alert('Please upload at least one credit report PDF.');
+    return;
+  }
+
+  modal.classList.add('open');
+  let idx = 0;
+  progress.textContent = PROGRESS_STEPS[0];
+  const progTimer = setInterval(() => {
+    idx = Math.min(idx + 1, PROGRESS_STEPS.length - 1);
+    progress.textContent = PROGRESS_STEPS[idx];
+  }, 4500);
+
+  const data = new FormData(form);
+  // Append each file (multi-file)
+  // FormData will already have the files from input[name=reports]
+
+  try {
+    const res = await fetch('/api/scan', { method: 'POST', body: data });
+    const json = await res.json();
+    clearInterval(progTimer);
+    if (json.success && json.resultsUrl) {
+      try {
+        sessionStorage.setItem('bullyScanResult', JSON.stringify(json.summary || {}));
+        if (json.downloadUrl) sessionStorage.setItem('bullyDocUrl', json.downloadUrl);
+      } catch(e){}
+      window.location.href = json.resultsUrl;
+    } else if (json.success && json.redirect) {
+      window.location.href = json.redirect;
+    } else {
+      progress.textContent = json.error || 'Something went wrong. Please try again.';
+    }
+  } catch (err) {
+    // Backend not running — show demo results so the flow is previewable
+    clearInterval(progTimer);
+    progress.textContent = 'Preview mode — showing sample results.';
+    setTimeout(() => {
+      window.location.href = 'results.html?demo=1';
+    }, 1200);
+  }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,30 @@
+# Fly.io config — deploy with: flyctl launch --copy-config --no-deploy then flyctl deploy
+app = "bureau-bullies"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/healthz"
+    timeout = "5s"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 1024
+
+[env]
+  CLAUDE_MODEL = "claude-sonnet-4-6"
+  MAX_FILE_MB = "25"
+  # Secrets (ANTHROPIC_API_KEY, GHL_API_KEY, GHL_LOCATION_ID) via:
+  #   flyctl secrets set ANTHROPIC_API_KEY=... GHL_API_KEY=... GHL_LOCATION_ID=...

@@ -319,7 +319,13 @@ def push_lead_to_ghl(
 ) -> dict:
     client = GHLClient()
 
-    tags = ["bureau-scan", f"tier-{recommended_tier}"]
+    # CORRECT FUNNEL LOGIC:
+    # Every new lead enters the $17 Toolkit Drip first — the cheap impulse buy.
+    # The analyzer's recommendation (accelerator / dfy) is stored as a
+    # "planned-tier-*" tag so we can upsell later (Day 3 Vault push,
+    # Day 7-14 DFY push for high-leverage leads) without triggering the
+    # wrong workflow on day 0.
+    tags = ["bureau-scan", "tier-toolkit", f"planned-tier-{recommended_tier}"]
     if urgency_score >= 80:
         tags.append("heat-critical")
     elif urgency_score >= 60:

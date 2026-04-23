@@ -1,9 +1,5 @@
 """
 Bureau Bullies — GoHighLevel (GHL) API integration
----------------------------------------------------
-Supports BOTH auth methods:
-  - v1 API  — JWT token (eyJ...) → base: https://rest.gohighlevel.com/v1
-  - v2 API  — Private Integration token (pit-...) → base: https://services.leadconnectorhq.com
 """
 
 from __future__ import annotations
@@ -83,7 +79,6 @@ class GHLClient:
         return r.json()
 
     def ensure_field(self, key, display_name=None, data_type=None):
-        """Make sure a custom field exists in GHL. Creates it if missing. Returns its ID."""
         if not self._field_cache:
             for f in self.list_custom_fields():
                 k = (f.get("fieldKey", "") or f.get("name", "")).replace("contact.", "")
@@ -122,7 +117,6 @@ class GHLClient:
                     field_map[key] = f.get("id") or f.get("_id")
             self._field_cache = field_map
             logger.info("Loaded %d existing GHL custom fields", len(field_map))
-        # Auto-create any missing fields
         for k in list(custom_fields.keys()):
             if k not in field_map:
                 self.ensure_field(k)
@@ -164,6 +158,34 @@ class GHLClient:
         r = requests.post(url, headers=self._headers, json={}, timeout=20)
         if not r.ok:
             raise GHLError(f"add_to_workflow: {r.status_code} {r.text[:300]}")
+
+    def send_email(self, contact_id, subject, html, plain=""):
+        """Send an email to a contact via GHL Conversations API. Returns True on success."""
+        if not contact_id or not subject:
+            return False
+        if self.version == "v1":
+            url = f"{V1_BASE}/conversations/messages"
+        else:
+            url = f"{V2_BASE}/conversations/messages"
+        payload = {"type": "Email", "contactId": contact_id, "subject": subject, "html": html or plain, "message": plain or ""}
+        try:
+            r = requests.post(url, headers=self._headers, json=payload, timeout=25)
+        except Exception as e:
+            logger.warning("send_email network error: %s", e)
+            return False
+        if r.ok:
+            logger.info("send_email OK → contact %s: %s", contact_id, subject[:60])
+            return True
+        alt_url = f"{V1_BASE}/contacts/{contact_id}/emails" if self.version == "v1" else f"{V2_BASE}/contacts/{contact_id}/emails"
+        try:
+            r2 = requests.post(alt_url, headers=self._headers, json=payload, timeout=25)
+            if r2.ok:
+                logger.info("send_email OK via /contacts/emails → %s", contact_id)
+                return True
+            logger.warning("send_email failed: primary %s %s | alt %s %s", r.status_code, r.text[:200], r2.status_code, r2.text[:200])
+        except Exception as e:
+            logger.warning("send_email alt path error: %s", e)
+        return False
 
     def add_tags(self, contact_id, tags):
         if self.version == "v1":

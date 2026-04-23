@@ -104,7 +104,7 @@ def _due_now(rows):
     now = datetime.now(timezone.utc)
     out = []
     for r in rows:
-        if r.get("status") != "pending":
+        if r.get("status") not in ("pending", "failed"):
             continue
         try:
             sa = datetime.fromisoformat(r["send_at"])

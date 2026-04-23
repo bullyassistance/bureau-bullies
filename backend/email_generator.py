@@ -1,23 +1,5 @@
 """
 Bureau Bullies — Email Drip Generator
---------------------------------------
-After a scan, this module uses Claude to generate 7 fully tailored email
-subject + body pairs that will be dripped out over 14 days.
-
-Each email is personalized with:
-  - Their scan data (top collection, dollar amount, violations, case law)
-  - Their stated goal (house / car / business / credit card / personal freedom)
-  - The exact pain point the collection blocks
-  - Amazon-style loss-aversion framing ("you might miss out on the house")
-
-CRITICAL RULES:
-  - Never use the word "killer" (carrier spam trigger)
-  - Never use "Collection Killer" — always say "Collection Toolkit"
-  - The $17 link is always https://thebureaubullies.com/ck
-  - Subject lines 6-10 words max
-  - Body 80-140 words for emails 1-3, 120-180 for emails 4-7
-  - Each email references specific scan facts and the goal
-  - Close every email with ONE clear CTA
 """
 
 from __future__ import annotations
@@ -71,7 +53,23 @@ Generate EXACTLY ONE email — subject + body — for the day/intent given. The 
 4. Reference their actual leverage $ and violation count.
 5. Cite one real federal case from their scan when relevant (Hinkle, Gorman, Saunders, Cushman, Johnson, Ramirez).
 6. Have ONE clear CTA at the end.
-7. Subject line: 6–10 words, includes first name OR a dollar amount, urgent not spammy.
+
+SUBJECT LINE RULES (critical — the whole sequence lives or dies on these):
+- MUST start with the consumer's first name followed by em-dash (—) OR a comma.
+- MUST reference ONE specific thing from THEIR actual report: the top creditor name, a specific dollar amount, their exact violation count, a specific bureau, or a specific case citation.
+- NEVER use product names in the subject ("Collection Toolkit", "Dispute Vault", "DFY"). Save product names for the body.
+- Length: 6–10 words, lowercase conversational feel, never ALL CAPS.
+- Voice: an insider who just looked at their file and is texting them privately — not a marketing blast.
+- Good examples:
+    "Koby — I just pulled your Experian, Equifax & TransUnion"
+    "Koby, that $7,000 Portfolio Recovery is your real problem"
+    "Koby — Portfolio Recovery could sue you this month"
+    "Koby, Hinkle v. Midland is basically your Portfolio Recovery case"
+    "Koby — I already wrote all 9 of your dispute letters"
+- Bad examples (never do these):
+    "URGENT: Save $14,500 today!"
+    "Your Collection Killer is ready"
+    "Buy the Dispute Vault now"
 
 THE PRODUCTS:
 - $17 Collection Toolkit — https://thebureaubullies.com/ck
@@ -114,7 +112,7 @@ SCAN DATA:
   Recommended tier: {scan.get('recommended_tier', 'toolkit')}
 
 RULES:
-- Subject 6-10 words, name or dollar amount, urgent not clickbait.
+- Subject MUST open with {consumer_first} + em-dash or comma, reference ONE specific thing from their report, 6-10 words, insider-texting-you tone, no product names.
 - Body 80-180 words. First line addresses {consumer_first} by name.
 - Cite the specific collection + dollar + goal.
 - Exactly ONE CTA with the right URL.

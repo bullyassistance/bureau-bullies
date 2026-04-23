@@ -250,6 +250,9 @@
     box-shadow: 0 0 0 4px rgba(225,29,46,0.15);
   }
   .field input::placeholder { color: #51596b; }
+  .field-full { grid-column: 1 / -1; }
+  .field select { appearance: none; -webkit-appearance: none; padding-right: 42px; cursor: pointer; }
+  .field select option { background: #13161f; color: var(--ink); }
 
   /* Drop zone */
   .drop {
@@ -574,6 +577,18 @@
         <div class="field">
           <label for="phone">Mobile number</label>
           <input id="phone" name="phone" type="tel" placeholder="(555) 000-0000" required />
+        </div>
+        <div class="field field-full">
+          <label for="goal">What are you trying to unlock?</label>
+          <select id="goal" name="goal" required>
+            <option value="" disabled selected>Pick the one that hits hardest</option>
+            <option value="house">A house / mortgage approval</option>
+            <option value="car">A car without a 15% APR</option>
+            <option value="business">Starting or funding a business</option>
+            <option value="credit_card">A real credit card (not secured)</option>
+            <option value="freedom">Getting collectors off my back</option>
+            <option value="peace">Peace of mind / financial freedom</option>
+          </select>
         </div>
       </div>
 

@@ -24,6 +24,7 @@ from bully_ai import chat as bully_chat
 from docgen import generate_report_doc
 from ghl import push_lead_to_ghl, GHLError
 from email_generator import generate_full_sequence, emails_to_ghl_fields, GOAL_FRAMES
+from scheduler import schedule_email_drip, cancel_drip, start_background_scheduler
 
 load_dotenv()
 
@@ -38,6 +39,8 @@ MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "25"))
 ALLOWED_MIME = {"application/pdf", "image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"}
 
 app = FastAPI(title="Bureau Bullies API", version="2.1.0")
+
+start_background_scheduler(app)
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
@@ -119,6 +122,7 @@ async def scan(
         custom_fields["cr_goal"] = goal_key
         custom_fields["cr_goal_label"] = goal_label
 
+        emails = []
         try:
             scan_ctx = {
                 "top_collection_name": summary.top_collection_name,
@@ -137,12 +141,22 @@ async def scan(
         except Exception as e:
             logger.exception("Email sequence generation failed (non-fatal): %s", e)
 
+        ghl_result = None
         try:
-            push_lead_to_ghl(first_name=firstName, last_name=lastName, email=email, phone=phone, custom_fields=custom_fields, urgency_score=summary.urgency_score, recommended_tier=summary.recommended_tier)
+            ghl_result = push_lead_to_ghl(first_name=firstName, last_name=lastName, email=email, phone=phone, custom_fields=custom_fields, urgency_score=summary.urgency_score, recommended_tier=summary.recommended_tier)
         except GHLError as e:
             logger.error("GHL push failed (non-fatal): %s", e)
         except Exception as e:
             logger.exception("GHL push unexpected error: %s", e)
+
+        try:
+            contact_id = ""
+            if ghl_result:
+                contact_id = (ghl_result.get("contact") or ghl_result).get("id") or (ghl_result.get("contact") or ghl_result).get("_id") or ""
+            if contact_id and emails:
+                schedule_email_drip(contact_id=contact_id, contact_email=email, first_name=firstName, emails=emails)
+        except Exception as e:
+            logger.exception("Failed to schedule email drip: %s", e)
 
         return JSONResponse({"success": True, "resultsUrl": "/results", "downloadUrl": f"/download/{token}", "summary": asdict(summary)})
     except HTTPException:
@@ -222,6 +236,15 @@ async def ghl_sms_reply(request):
     except Exception as e:
         logger.exception("SMS reply chat failed")
         reply_text = f"{first_name + ' — ' if first_name else ''}Bully AI here. Got your message. Give me a few minutes and I'll get back to you. — BB"
+    # Cancel the email drip if they replied STOP or DONE
+    try:
+        lo = message.lower().strip()
+        if lo in ("stop", "done", "unsubscribe", "remove"):
+            contact_id = (payload.get("contact_id") or (payload.get("contact") or {}).get("id") or "")
+            if contact_id:
+                cancel_drip(contact_id, reason="unsubscribed")
+    except Exception:
+        pass
     lower = reply_text.lower()
     link_sent = None
     if "thecollectionkiller.com/dispute-vault" in lower:
@@ -231,6 +254,54 @@ async def ghl_sms_reply(request):
     elif "thebureaubullies.com/ck" in lower or "thecollectionkiller.com" in lower:
         link_sent = "toolkit"
     return {"ok": True, "reply": reply_text, "link_sent": link_sent, "first_name": first_name}
+
+
+@app.post("/webhooks/ghl/email-reply")
+async def ghl_email_reply(request):
+    """Route inbound email replies through Bully AI, same as SMS."""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    message = _as_string(payload.get("message") or payload.get("body") or payload.get("text") or (payload.get("email") or {}).get("body") or "").strip()
+    if not message:
+        return {"reply": "Got your note — I'll circle back shortly.", "ok": False}
+    first_name = payload.get("first_name") or payload.get("firstName") or (payload.get("contact") or {}).get("first_name") or ""
+    custom = {}
+    for k, v in payload.items():
+        if k.startswith("cr_") and v not in (None, ""):
+            custom[k] = v
+    for k, v in (payload.get("custom_fields") or {}).items():
+        if v not in (None, ""):
+            custom[k] = v
+    for k, v in (payload.get("customData") or {}).items():
+        if v not in (None, ""):
+            custom[k] = v
+    contact_block = payload.get("contact") or {}
+    for k, v in contact_block.items():
+        if k.startswith("cr_") and v not in (None, ""):
+            custom[k] = v
+    if first_name and "cr_first_name" not in custom:
+        custom["cr_first_name"] = first_name
+    try:
+        reply_text = bully_chat(user_message=message, contact_context=custom or None, history=[])
+    except Exception as e:
+        logger.exception("Email reply chat failed")
+        reply_text = f"{first_name + ' — ' if first_name else ''}Bully AI here. Got your email. I'll look at your file again and respond shortly."
+    # Cancel drip on unsubscribe words
+    try:
+        lo = message.lower().strip()
+        if any(w in lo for w in ("unsubscribe", "remove me", "stop emailing", "stop sending", "take me off", "done")):
+            contact_id = (payload.get("contact_id") or (payload.get("contact") or {}).get("id") or "")
+            if contact_id:
+                cancel_drip(contact_id, reason="unsubscribed")
+    except Exception:
+        pass
+    # Build subject
+    subject = "Re: your report"
+    if first_name:
+        subject = f"{first_name} — re: your report"
+    return {"ok": True, "subject": subject, "reply": reply_text, "first_name": first_name}
 
 
 @app.get("/healthz")

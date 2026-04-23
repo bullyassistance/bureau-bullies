@@ -55,17 +55,15 @@ ALLOWED_MIME = {
 
 app = FastAPI(title="Bureau Bullies API", version="2.0.0")
 
-# Allow the landing page to call /api/scan from any origin (GHL embed, custom domain, etc.)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],         # Tighten to your actual domains in production
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ---- Static pages --------------------------------------------------------
 @app.get("/")
 def landing():
     return FileResponse(FRONTEND_DIR / "index.html")
@@ -94,7 +92,6 @@ def privacy():
     return FileResponse(FRONTEND_DIR / "privacy.html")
 
 
-# ---- Scan endpoint -------------------------------------------------------
 @app.post("/api/scan")
 async def scan(
     firstName: str = Form(...),
@@ -125,7 +122,6 @@ async def scan(
             saved.append(dest)
             logger.info("Saved %s (%.1f KB, %s)", upload.filename, size / 1024, upload.content_type)
 
-        # ---- Bully AI analysis -------------------------------------------
         summary = analyze_report(
             pdf_paths=saved,
             consumer_name=f"{firstName} {lastName}",
@@ -133,7 +129,6 @@ async def scan(
             scratch_dir=tmpdir,
         )
 
-        # ---- Generate Word doc ------------------------------------------
         token = secrets.token_urlsafe(24)
         doc_path = DOWNLOAD_DIR / f"{token}.docx"
         generate_report_doc(
@@ -146,9 +141,8 @@ async def scan(
         )
         logger.info("Generated doc: %s", doc_path)
 
-        # ---- Push to GHL -------------------------------------------------
         custom_fields = summary_to_ghl_fields(summary)
-        custom_fields["cr_doc_url"] = f"/download/{token}"  # surfaced in SMS
+        custom_fields["cr_doc_url"] = f"/download/{token}"
         try:
             push_lead_to_ghl(
                 first_name=firstName,
@@ -183,7 +177,6 @@ async def scan(
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ---- Download the generated doc ------------------------------------------
 @app.get("/download/{token}")
 def download(token: str):
     path = DOWNLOAD_DIR / f"{token}.docx"
@@ -196,11 +189,10 @@ def download(token: str):
     )
 
 
-# ---- Bully AI chat endpoint (for GHL SMS reply webhook) ------------------
 class ChatIn(BaseModel):
     message: str
-    contact: dict = {}       # GHL custom fields dump
-    history: list = []       # prior turns
+    contact: dict = {}
+    history: list = []
 
 
 @app.post("/api/chat")
@@ -217,52 +209,37 @@ def chat(payload: ChatIn):
         raise HTTPException(500, f"Chat error: {e}")
 
 
-# ---- GHL-native SMS reply webhook ----------------------------------------
-# Accepts whatever shape GHL sends ({body: str, contact: {...}, customData: {...}}
-# and returns a JSON response that GHL's workflow can use to send an SMS back.
-#
-# GHL workflow setup:
-#   Trigger: Customer Replied (SMS)
-#   Step 1: Webhook → POST https://bureau-bullies.onrender.com/webhooks/ghl/sms-reply
-#           Body: {
-#             "message": "{{message.body}}",
-#             "first_name": "{{contact.first_name}}",
-#             "contact_id": "{{contact.id}}",
-#             "custom_fields": {
-#               "cr_top_collection_name": "{{custom_values.cr_top_collection_name}}",
-#               "cr_total_leverage": "{{custom_values.cr_total_leverage}}",
-#               "cr_violations_count": "{{custom_values.cr_violations_count}}",
-#               "cr_recommended_tier": "{{contact.cr_recommended_tier}}",
-#               "cr_top_pain_point": "{{contact.cr_top_pain_point}}",
-#               "cr_exec_summary":   "{{contact.cr_exec_summary}}"
-#             }
-#           }
-#   Step 2: Send SMS → Message body: {{webhook.response.reply}}
+def _as_string(v):
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, dict):
+        return str(v.get("body") or v.get("text") or v.get("content") or v.get("message") or "")
+    return str(v)
+
+
 @app.post("/webhooks/ghl/sms-reply")
 async def ghl_sms_reply(request: Request):
-    """
-    Accept an inbound SMS reply from GHL and route it through Bully AI.
-    Returns a shape GHL's workflow can use to send the response SMS.
-    """
+    """Accept an inbound SMS reply from GHL and route it through Bully AI."""
     try:
         payload = await request.json()
     except Exception:
         payload = {}
 
-    # GHL can send in many shapes — be liberal in what we accept.
-    message = (
+    message = _as_string(
         payload.get("message")
         or payload.get("body")
         or payload.get("sms")
         or payload.get("text")
+        or (payload.get("customData") or {}).get("message")
         or ""
     ).strip()
 
     if not message:
-        logger.warning("SMS reply webhook received empty message: %s", payload)
+        logger.warning("SMS reply webhook received empty message: %s", str(payload)[:300])
         return {"reply": "Got your message — let me pull your report and get right back to you.", "ok": False}
 
-    # Gather as much contact context as GHL passed
     first_name = (
         payload.get("first_name")
         or payload.get("firstName")
@@ -270,7 +247,6 @@ async def ghl_sms_reply(request: Request):
         or ""
     )
 
-    # Merge custom_fields + top-level cr_* fields + contact custom field dump
     custom = {}
     for k, v in payload.items():
         if k.startswith("cr_") and v not in (None, ""):
@@ -304,15 +280,11 @@ async def ghl_sms_reply(request: Request):
         )
     except Exception as e:
         logger.exception("SMS reply chat failed")
-        # Graceful fallback — never return 500 to GHL so the workflow doesn't break
         reply_text = (
             f"{first_name + ' — ' if first_name else ''}"
-            "Bully AI here. Got your message. Give me a few minutes and I'll get "
-            "back to you with a real answer. — BB"
+            "Bully AI here. Got your message. Give me a few minutes and I'll get back to you. — BB"
         )
 
-    # Heuristic: figure out if Bully AI's reply mentions a link so GHL can
-    # route through the right follow-up workflow if it wants
     lower = reply_text.lower()
     link_sent = None
     if "thecollectionkiller.com/dispute-vault" in lower:
@@ -335,7 +307,6 @@ def healthz():
     return {"ok": True}
 
 
-# Allow `python app.py` to run the server directly (handy for Render / Fly)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(

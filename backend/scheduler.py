@@ -1,5 +1,31 @@
 """
 Bureau Bullies — Email Drip Scheduler
+--------------------------------------
+Simple persistent job queue that dispatches scheduled emails to GHL contacts
+without requiring a GHL workflow.
+
+Why this exists:
+  - The GHL workflow editor doesn't always load in embedded browser contexts,
+    so we can't guarantee a per-scan email drip via pure GHL workflow actions.
+  - Instead, the backend stores each scheduled email in a JSON file and a
+    background task polls it every 60 seconds, sending what's due.
+
+Flow:
+  1. On /api/scan, backend pre-generates 7 tailored emails (already shipping).
+  2. It also calls `schedule_email_drip(contact_id, contact_email, emails)` —
+     this enqueues 7 rows into scheduled_emails.json with send-at timestamps
+     based on the SEQUENCE cadence (0, 1, 3, 5, 7, 10, 14 days).
+  3. On FastAPI startup, a background task is started that polls the queue
+     every POLL_SECONDS and dispatches any emails whose send_at < now.
+  4. After an email sends, it's marked status=sent (kept for audit) so it
+     never double-fires.
+
+Exit conditions honored:
+  - Contact tag includes "purchased-toolkit" or "unsubscribed" → cancel future
+  - Reply received → cancel future (flipped via /webhooks/ghl/sms-reply)
+
+Storage: /tmp/bullies_scheduled_emails.json by default. Override with
+  BB_SCHEDULER_DB env var.
 """
 
 from __future__ import annotations
@@ -9,6 +35,7 @@ import json
 import logging
 import os
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -18,24 +45,27 @@ logger = logging.getLogger("bureau-bullies.scheduler")
 DB_PATH = Path(os.getenv("BB_SCHEDULER_DB", "/tmp/bullies_scheduled_emails.json"))
 POLL_SECONDS = int(os.getenv("BB_SCHEDULER_POLL_SECONDS", "60"))
 
+# Cadence in seconds from scan time for each of the 7 emails.
+# Day 0 is 2 minutes to give GHL time to create the contact first.
 CADENCE_SECONDS = [
-    2 * 60,
-    1 * 86400,
-    3 * 86400,
-    5 * 86400,
-    7 * 86400,
-    10 * 86400,
-    14 * 86400,
+    2 * 60,                  # Email 1 — 2 minutes
+    1 * 86400,               # Email 2 — 1 day
+    3 * 86400,               # Email 3 — 3 days
+    5 * 86400,               # Email 4 — 5 days
+    7 * 86400,               # Email 5 — 7 days
+    10 * 86400,              # Email 6 — 10 days
+    14 * 86400,              # Email 7 — 14 days
 ]
 
+# Thread-safe lock around the JSON file
 _file_lock = threading.Lock()
 
 
-def _now_iso():
+def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _load_db():
+def _load_db() -> List[dict]:
     with _file_lock:
         if not DB_PATH.exists():
             return []
@@ -46,7 +76,7 @@ def _load_db():
             return []
 
 
-def _save_db(rows):
+def _save_db(rows: List[dict]) -> None:
     with _file_lock:
         DB_PATH.parent.mkdir(exist_ok=True, parents=True)
         tmp = DB_PATH.with_suffix(".tmp")
@@ -54,13 +84,27 @@ def _save_db(rows):
         tmp.replace(DB_PATH)
 
 
-def schedule_email_drip(contact_id, contact_email, first_name, emails, scan_time=None):
-    """Enqueue the 7-email drip for a single contact."""
+def schedule_email_drip(
+    contact_id: str,
+    contact_email: str,
+    first_name: str,
+    emails: List[dict],
+    scan_time: Optional[datetime] = None,
+) -> int:
+    """
+    Enqueue the 7-email drip for a single contact.
+
+    emails: list of {"day": int, "subject": str, "body": str} (output from
+            email_generator.generate_full_sequence)
+    Returns: number of emails enqueued.
+    """
     if not contact_id or not contact_email:
         logger.warning("Cannot schedule drip — missing contact_id or email")
         return 0
+
     if scan_time is None:
         scan_time = datetime.now(timezone.utc)
+
     rows = _load_db()
     count = 0
     for i, email in enumerate(emails or []):
@@ -86,7 +130,8 @@ def schedule_email_drip(contact_id, contact_email, first_name, emails, scan_time
     return count
 
 
-def cancel_drip(contact_id, reason="cancelled"):
+def cancel_drip(contact_id: str, reason: str = "cancelled") -> int:
+    """Cancel all pending emails for a contact (e.g., they bought or unsubscribed)."""
     rows = _load_db()
     n = 0
     for r in rows:
@@ -100,11 +145,18 @@ def cancel_drip(contact_id, reason="cancelled"):
     return n
 
 
-def _due_now(rows):
+MAX_RETRIES = 5
+
+
+def _due_now(rows: List[dict]) -> List[dict]:
+    """Return pending rows AND failed rows (for retry, up to MAX_RETRIES) that are due."""
     now = datetime.now(timezone.utc)
     out = []
     for r in rows:
-        if r.get("status") not in ("pending", "failed"):
+        status = r.get("status")
+        if status not in ("pending", "failed"):
+            continue
+        if status == "failed" and r.get("retry_count", 0) >= MAX_RETRIES:
             continue
         try:
             sa = datetime.fromisoformat(r["send_at"])
@@ -117,50 +169,118 @@ def _due_now(rows):
     return out
 
 
-def _dispatch_due():
-    from ghl import GHLClient
+def reset_all_failed() -> int:
+    """Utility — reset every 'failed' row back to 'pending' so the next tick retries them.
+    Used after swapping GHL tokens or fixing the send endpoint."""
+    rows = _load_db()
+    n = 0
+    for r in rows:
+        if r.get("status") == "failed":
+            r["status"] = "pending"
+            r["retry_count"] = 0
+            r.pop("error", None)
+            n += 1
+    if n:
+        _save_db(rows)
+        logger.info("Reset %d failed rows back to pending", n)
+    return n
+
+
+def _dispatch_due() -> int:
+    """
+    Called by the polling loop. Sends any due emails and marks them sent.
+    Returns number dispatched this tick.
+    """
+    from ghl import GHLClient  # local import to avoid circular
+
     rows = _load_db()
     due = _due_now(rows)
     if not due:
         return 0
+
     try:
         client = GHLClient()
     except Exception as e:
         logger.warning("Scheduler: GHL client init failed, retrying later: %s", e)
         return 0
+
     sent = 0
     for r in due:
         try:
+            body_with_sig = _append_signature_and_footer(r["body"])
             ok = client.send_email(
                 contact_id=r["contact_id"],
                 subject=r["subject"],
-                html=_plaintext_to_html(r["body"]),
-                plain=r["body"],
+                html=_plaintext_to_html(body_with_sig),
+                plain=body_with_sig,
             )
             r["status"] = "sent" if ok else "failed"
             r["dispatched_at"] = _now_iso()
             if ok:
+                r.pop("error", None)
+                r["retry_count"] = r.get("retry_count", 0)
                 sent += 1
                 logger.info("Sent email %d to %s: %r", r["email_index"], r["contact_email"], r["subject"][:60])
             else:
-                logger.warning("Email send returned False for %s", r["contact_id"])
+                r["retry_count"] = r.get("retry_count", 0) + 1
+                logger.warning("Email send returned False for %s (retry %d/%d)",
+                               r["contact_id"], r["retry_count"], MAX_RETRIES)
         except Exception as e:
             logger.exception("Email dispatch error for %s: %s", r.get("contact_id"), e)
             r["status"] = "failed"
+            r["retry_count"] = r.get("retry_count", 0) + 1
             r["error"] = str(e)[:500]
+
     _save_db(rows)
     return sent
 
 
-def _plaintext_to_html(body):
+SIGNATURE_PLAIN = (
+    "\n\n— Umar\n"
+    "Bully AI · The Bureau Bullies\n"
+    "Reply to this email if you want me to walk you through your plan."
+)
+
+FOOTER_PLAIN = (
+    "\n\n---\n"
+    "Sent because you scanned your credit report at bullyaiagent.com. "
+    "Not interested? Reply STOP and I won't email again.\n"
+    "The Bureau Bullies LLC · Edgemoor, GA"
+)
+
+
+def _append_signature_and_footer(body: str) -> str:
+    """Add a human signature + CAN-SPAM-compliant footer to any email body."""
+    if not body:
+        return body
+    # Avoid double-appending if already present
+    if "Bully AI · The Bureau Bullies" in body:
+        return body
+    return body.rstrip() + SIGNATURE_PLAIN + FOOTER_PLAIN
+
+
+def _plaintext_to_html(body: str) -> str:
+    """Lightweight plain-text → HTML conversion preserving line breaks + links."""
     import re
     esc = (body or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    esc = re.sub(r"(https?://[^\s<]+)", r'<a href="\1" style="color:#e11d2e;text-decoration:underline;">\1</a>', esc)
-    paragraphs = ["<p style=\"margin:0 0 12px 0;\">" + p.replace("\n", "<br/>") + "</p>" for p in esc.split("\n\n") if p.strip()]
-    return ('<div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;font-size:15px;line-height:1.5;color:#111;max-width:580px;">' + "\n".join(paragraphs) + "</div>")
+    # auto-link http(s) URLs
+    esc = re.sub(
+        r"(https?://[^\s<]+)",
+        r'<a href="\1" style="color:#e11d2e;text-decoration:underline;">\1</a>',
+        esc,
+    )
+    paragraphs = ["<p style=\"margin:0 0 12px 0;\">" + p.replace("\n", "<br/>") + "</p>"
+                  for p in esc.split("\n\n") if p.strip()]
+    return (
+        '<div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;'
+        'font-size:15px;line-height:1.5;color:#111;max-width:580px;">'
+        + "\n".join(paragraphs)
+        + "</div>"
+    )
 
 
 async def _poll_loop():
+    """Background async loop that dispatches due emails every POLL_SECONDS."""
     logger.info("Email scheduler poll loop started (every %ds)", POLL_SECONDS)
     while True:
         try:
@@ -172,11 +292,14 @@ async def _poll_loop():
         await asyncio.sleep(POLL_SECONDS)
 
 
-def start_background_scheduler(app):
+def start_background_scheduler(app) -> None:
+    """Attach the scheduler to a FastAPI app's startup/shutdown events."""
     task_ref = {}
+
     @app.on_event("startup")
     async def _start():
         task_ref["task"] = asyncio.create_task(_poll_loop())
+
     @app.on_event("shutdown")
     async def _stop():
         t = task_ref.get("task")

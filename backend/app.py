@@ -424,6 +424,58 @@ def _ig_as_string(v) -> str:
     return str(v)
 
 
+def _ig_extract_contact_id(payload: dict) -> str:
+    """Pull the GHL contact id out of an IG webhook payload, regardless of
+    which token name the user wired in the GHL workflow's Custom Data."""
+    if not isinstance(payload, dict):
+        return ""
+    candidates = [
+        payload.get("contact_id"),
+        payload.get("contactId"),
+        payload.get("contact_Id"),
+        (payload.get("contact") or {}).get("id") if isinstance(payload.get("contact"), dict) else None,
+        (payload.get("contact") or {}).get("_id") if isinstance(payload.get("contact"), dict) else None,
+        (payload.get("customData") or {}).get("contact_id") if isinstance(payload.get("customData"), dict) else None,
+        (payload.get("customData") or {}).get("contactId") if isinstance(payload.get("customData"), dict) else None,
+    ]
+    for c in candidates:
+        if c and isinstance(c, str) and len(c) >= 8:
+            return c
+    return ""
+
+
+def _ig_extract_comment_id(payload: dict) -> str:
+    """Optional — pull an IG comment id from the payload so GHL can send a
+    'reply to comment via DM' which bypasses the 24hr engagement rule."""
+    if not isinstance(payload, dict):
+        return ""
+    candidates = [
+        payload.get("comment_id"),
+        payload.get("commentId"),
+        payload.get("ig_comment_id"),
+        (payload.get("trigger") or {}).get("comment_id") if isinstance(payload.get("trigger"), dict) else None,
+        (payload.get("customData") or {}).get("comment_id") if isinstance(payload.get("customData"), dict) else None,
+    ]
+    for c in candidates:
+        if c and isinstance(c, str):
+            return c
+    return ""
+
+
+def _ig_send_dm_safe(contact_id: str, reply: str, *, comment_id: str = "") -> bool:
+    """Best-effort send an IG DM via GHL Conversations API.
+    Never raises — logs and returns False on any failure."""
+    if not contact_id or not reply:
+        return False
+    try:
+        from ghl import GHLClient
+        client = GHLClient()
+        return client.send_ig_dm(contact_id, reply, comment_id=comment_id or None)
+    except Exception as e:
+        logger.warning("_ig_send_dm_safe failed: %s", e)
+        return False
+
+
 def _ig_route_intent(text: str) -> str:
     """Quick keyword router that decides if this is a 'free guide / ME' kickoff or a real conversation.
     Returns 'opener' (first contact, send the upload link) or 'conversation' (real chat)."""
@@ -490,7 +542,21 @@ async def ig_comment_router(request: Request):
             "https://bullyaiagent.com/#upload  (pull free at annualcreditreport.com first). "
             "What's your #1 goal — house, car, or just clean credit?"
         )
-    return {"ok": True, "reply": reply_text, "first_name": first_name}
+
+    # Send the DM directly via GHL Conversations API. GHL's standard "Webhook"
+    # workflow action is fire-and-forget (doesn't capture this response body),
+    # so {{webhook.response.reply}} in a downstream "Send IG DM" action would
+    # always be empty. Sending here closes the loop. Falls back gracefully if
+    # contact_id wasn't passed in the payload.
+    contact_id = _ig_extract_contact_id(payload)
+    comment_id = _ig_extract_comment_id(payload)
+    sent = _ig_send_dm_safe(contact_id, reply_text, comment_id=comment_id)
+    return {
+        "ok": True,
+        "reply": reply_text,
+        "first_name": first_name,
+        "sent_via_backend": bool(sent),
+    }
 
 
 @app.post("/webhooks/ig/dm")
@@ -552,7 +618,15 @@ async def ig_dm_router(request: Request):
             "If you haven't yet, drop your reports at https://bullyaiagent.com/#upload"
         )
 
-    return {"ok": True, "reply": reply_text, "first_name": first_name, "ig_handle": ig_handle}
+    contact_id = _ig_extract_contact_id(payload)
+    sent = _ig_send_dm_safe(contact_id, reply_text)
+    return {
+        "ok": True,
+        "reply": reply_text,
+        "first_name": first_name,
+        "ig_handle": ig_handle,
+        "sent_via_backend": bool(sent),
+    }
 
 
 @app.post("/webhooks/ig/nurture")
@@ -615,7 +689,15 @@ async def ig_nurture_router(request: Request):
                 "When you're ready to face what's on your report: https://bullyaiagent.com/#upload"
             )
 
-    return {"ok": True, "reply": reply_text, "first_name": first_name, "tick": tick}
+    contact_id = _ig_extract_contact_id(payload)
+    sent = _ig_send_dm_safe(contact_id, reply_text)
+    return {
+        "ok": True,
+        "reply": reply_text,
+        "first_name": first_name,
+        "tick": tick,
+        "sent_via_backend": bool(sent),
+    }
 
 
 @app.post("/admin/reset-failed-emails")

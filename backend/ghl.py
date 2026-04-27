@@ -319,6 +319,33 @@ class GHLClient:
             logger.warning("send_email alt path error: %s", e)
         return False
 
+    # ---- SMS send (direct via GHL Conversations API) --------------------
+    def send_sms(self, phone: str, message: str) -> bool:
+        """Send a one-off SMS to a phone number via GHL. Used for handoff alerts to Umar.
+        Returns True on success, False on failure (logged, not raised)."""
+        if not phone or not message:
+            return False
+        if self.version == "v1":
+            url = f"{V1_BASE}/conversations/messages"
+        else:
+            url = f"{V2_BASE}/conversations/messages"
+        payload = {
+            "type": "SMS",
+            "phone": phone,
+            "message": message[:1500],
+            "locationId": self.location_id,
+        }
+        try:
+            r = requests.post(url, headers=self._headers, json=payload, timeout=15)
+        except Exception as e:
+            logger.warning("send_sms network error: %s", e)
+            return False
+        if r.ok:
+            logger.info("send_sms OK -> %s: %s", phone[-4:], message[:60])
+            return True
+        logger.warning("send_sms failed (%s): %s", r.status_code, r.text[:200])
+        return False
+
     # ---- Instagram DM send (direct via GHL Conversations API) -----------
     def send_ig_dm(
         self,
@@ -480,6 +507,79 @@ class GHLClient:
             logger.warning("is_human_active conversation check failed: %s", e)
 
         return False
+
+    # ---- Conversation history fetch -------------------------------------
+    def get_recent_messages(self, contact_id: str, limit: int = 10) -> list:
+        """
+        Fetch the last N messages in this contact's conversation, formatted
+        as Anthropic-style history: [{role: "user"|"assistant", content: "..."}].
+
+        Used by the IG/SMS webhook so Bully AI has memory of prior turns.
+        Returns oldest-first (so the model sees them in chronological order).
+        Returns [] on any failure (caller falls back to no-history mode).
+        """
+        if not contact_id or self.version != "v2":
+            return []
+        try:
+            # Find the conversation
+            r = requests.post(
+                f"{V2_BASE}/conversations/search",
+                headers=self._headers,
+                json={"locationId": self.location_id, "contactId": contact_id, "limit": 1},
+                timeout=10,
+            )
+            if not r.ok:
+                return []
+            conversations = r.json().get("conversations", []) or []
+            if not conversations:
+                return []
+            conv_id = conversations[0].get("id") or conversations[0].get("_id")
+            if not conv_id:
+                return []
+
+            # Fetch messages
+            r = requests.get(
+                f"{V2_BASE}/conversations/{conv_id}/messages",
+                headers=self._headers,
+                params={"limit": limit},
+                timeout=10,
+            )
+            if not r.ok:
+                return []
+            data = r.json()
+            messages = (data.get("messages") or {}).get("messages") or data.get("messages") or []
+
+            # Convert to Anthropic format. GHL returns newest-first, so reverse.
+            history = []
+            for msg in reversed(messages[:limit]):
+                direction = (msg.get("direction") or msg.get("type") or "").lower()
+                body = (msg.get("body") or msg.get("message") or "").strip()
+                if not body:
+                    continue
+                # inbound = user said it, outbound = assistant (or human Umar) said it
+                if "inbound" in direction:
+                    role = "user"
+                elif "outbound" in direction:
+                    role = "assistant"
+                else:
+                    continue
+                history.append({"role": role, "content": body[:1500]})
+
+            # Anthropic requires alternating user/assistant. Collapse runs.
+            collapsed = []
+            for m in history:
+                if collapsed and collapsed[-1]["role"] == m["role"]:
+                    collapsed[-1]["content"] += "\n" + m["content"]
+                else:
+                    collapsed.append(m)
+
+            # Drop trailing assistant turn (the last user msg will be appended by caller)
+            if collapsed and collapsed[-1]["role"] == "assistant":
+                pass  # OK to leave it
+            return collapsed[-10:]  # cap at 10 turns
+        except Exception as e:
+            logger.warning("get_recent_messages failed: %s", e)
+            return []
 
     # ---- Contact search by tag ------------------------------------------
     def search_contacts_by_tag(self, tag: str, limit: int = 500) -> list:

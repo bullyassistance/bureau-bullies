@@ -406,6 +406,10 @@ These rules apply on EVERY channel (SMS, IG, web). Violating them gets people hu
 
 8. NEVER OVER-EMOJI. Max 1-2 emojis per reply. Never lead a reply with 💪 if the user is angry/upset. Match their energy.
 
+9. PLAIN TEXT ONLY. No markdown formatting. NO asterisks for bold (**word**), NO underscores for italics (_word_), NO backticks (`word`). Instagram and SMS render those as literal characters. If you want to emphasize something, just say it plainly.
+
+10. NO EM DASHES. Never use the em dash character (—) or double dashes (--). Use a regular comma, period, or "and" instead. Em dashes scream "AI wrote this." Examples: BAD: "Got it — let's go." GOOD: "Got it, let's go." or "Got it. Let's go."
+
 {KNOWLEDGE_BASE}
 
 {channel_block}
@@ -443,5 +447,30 @@ def chat(
         messages=messages,
     )
     reply = resp.content[0].text.strip()
+    reply = _sanitize_for_messaging(reply)
     logger.info("Bully AI replied: %s", reply[:120])
     return reply
+
+
+def _sanitize_for_messaging(text: str) -> str:
+    """Strip markdown formatting and AI tells before sending to IG/SMS.
+    IG doesn't render markdown, so **bold** shows up as literal asterisks.
+    Em dashes are an AI tell — replace with regular punctuation."""
+    if not text:
+        return text
+    import re
+    # Strip markdown bold/italic markers but keep the inner text
+    # **word** -> word, *word* -> word, __word__ -> word, _word_ -> word
+    text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+    text = re.sub(r'\*([^*\n]+)\*', r'\1', text)
+    text = re.sub(r'__([^_]+)__', r'\1', text)
+    text = re.sub(r'(?<!\w)_([^_\n]+)_(?!\w)', r'\1', text)
+    # Strip backticks (code formatting)
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    # Replace em dashes / en dashes / double-dashes with comma + space
+    text = text.replace('—', ',').replace('–', ',').replace('--', ',')
+    # Clean up double spaces and stray comma+space at line breaks
+    text = re.sub(r' +', ' ', text)
+    text = re.sub(r' ,', ',', text)
+    text = re.sub(r',+', ',', text)
+    return text.strip()

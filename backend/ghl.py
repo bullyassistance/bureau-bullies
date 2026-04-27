@@ -394,6 +394,93 @@ class GHLClient:
         logger.warning("send_ig_dm failed for %s: %s", contact_id, last_err)
         return False
 
+    # ---- Human-override detection ---------------------------------------
+    def is_human_active(self, contact_id: str) -> bool:
+        """
+        Returns True if a human (Umar) has been active in this conversation
+        and the AI should stand down. Two signals:
+
+          1. Contact has a "pause-ai" / "manual-mode" / "human-active" tag
+          2. The most recent OUTBOUND message in the conversation was sent
+             by a human user (source != api/automation/integration)
+
+        If either is True, we don't auto-reply.
+        """
+        if not contact_id:
+            return False
+
+        # ---- Signal 1: tag check ----
+        try:
+            if self.version == "v1":
+                url = f"{V1_BASE}/contacts/{contact_id}"
+            else:
+                url = f"{V2_BASE}/contacts/{contact_id}"
+            r = requests.get(url, headers=self._headers, timeout=10)
+            if r.ok:
+                contact = r.json().get("contact") or r.json() or {}
+                tags = contact.get("tags") or []
+                pause_tags = {"pause-ai", "manual-mode", "human-active", "ai-off"}
+                if any(t.lower() in pause_tags for t in tags):
+                    logger.info("is_human_active: pause-ai tag found on %s", contact_id)
+                    return True
+        except Exception as e:
+            logger.warning("is_human_active tag check failed: %s", e)
+
+        # ---- Signal 2: last outbound message source ----
+        try:
+            # Find conversation
+            if self.version == "v2":
+                conv_url = f"{V2_BASE}/conversations/search"
+                r = requests.post(
+                    conv_url,
+                    headers=self._headers,
+                    json={"locationId": self.location_id, "contactId": contact_id, "limit": 1},
+                    timeout=10,
+                )
+            else:
+                # v1 doesn't have a clean conv search by contact, skip signal 2
+                return False
+
+            if not r.ok:
+                return False
+            conversations = r.json().get("conversations", []) or []
+            if not conversations:
+                return False
+            conv_id = conversations[0].get("id") or conversations[0].get("_id")
+            if not conv_id:
+                return False
+
+            # Get last 10 messages
+            msg_url = f"{V2_BASE}/conversations/{conv_id}/messages"
+            r = requests.get(msg_url, headers=self._headers, params={"limit": 10}, timeout=10)
+            if not r.ok:
+                return False
+            data = r.json()
+            messages = (data.get("messages") or {}).get("messages") or data.get("messages") or []
+
+            # Look at outbound messages from newest to oldest
+            for msg in messages[:10]:
+                direction = (msg.get("direction") or msg.get("type") or "").lower()
+                source = (msg.get("source") or msg.get("messageType") or "").lower()
+                user_id = msg.get("userId") or msg.get("user_id") or ""
+                if "outbound" not in direction:
+                    continue
+                # AI sends via API → source contains 'api' / 'integration' / 'automation' / 'workflow'
+                ai_sources = {"api", "integration", "automation", "workflow", "bot"}
+                if any(s in source for s in ai_sources):
+                    # AI sent this — keep looking; if first outbound is AI, allow auto-reply
+                    return False
+                # Otherwise this was a human (agent/manual/UI send) → pause AI
+                logger.info(
+                    "is_human_active: human outbound found (source=%s, userId=%s) — pausing AI",
+                    source, user_id,
+                )
+                return True
+        except Exception as e:
+            logger.warning("is_human_active conversation check failed: %s", e)
+
+        return False
+
     # ---- Contact search by tag ------------------------------------------
     def search_contacts_by_tag(self, tag: str, limit: int = 500) -> list:
         """Return list of contacts that carry the given tag. Paginates up to `limit`."""

@@ -372,11 +372,22 @@ async def ghl_sms_reply(request: Request):
     if first_name and "cr_first_name" not in custom:
         custom["cr_first_name"] = first_name
 
-    history = payload.get("history") or []
+    # Pull contact_id and conversation history so SMS replies have memory of prior turns
+    contact_id = (
+        payload.get("contact_id") or payload.get("contactId")
+        or (payload.get("contact") or {}).get("id") or ""
+    )
+
+    # Skip if Umar is already replying manually
+    if contact_id and _ig_human_active(contact_id):
+        logger.info("SMS reply skipped — human active for contact %s", contact_id)
+        return {"ok": True, "skipped": "human_active", "first_name": first_name}
+
+    history = payload.get("history") or _ig_fetch_history(contact_id)
 
     logger.info(
-        "SMS reply from %s: %r  (ctx keys: %s)",
-        first_name or "unknown", message[:80], list(custom.keys())[:8]
+        "SMS reply from %s: %r  (ctx keys: %s, history turns: %d)",
+        first_name or "unknown", message[:80], list(custom.keys())[:8], len(history)
     )
 
     try:
@@ -387,12 +398,17 @@ async def ghl_sms_reply(request: Request):
         )
     except Exception as e:
         logger.exception("SMS reply chat failed")
-        # Graceful fallback — never return 500 to GHL so the workflow doesn't break
+        # Graceful fallback, never return 500 to GHL so the workflow doesn't break
         reply_text = (
-            f"{first_name + ' — ' if first_name else ''}"
+            f"{first_name + ', ' if first_name else ''}"
             "Bully AI here. Got your message. Give me a few minutes and I'll get "
-            "back to you with a real answer. — BB"
+            "back to you with a real answer. BB"
         )
+
+    # Auto-handoff if Bully AI promised a human
+    if _detect_handoff(reply_text):
+        logger.info("Handoff detected in SMS reply for contact %s", contact_id)
+        _do_handoff(contact_id, first_name, message)
 
     # Heuristic: figure out if Bully AI's reply mentions a link so GHL can
     # route through the right follow-up workflow if it wants
@@ -410,6 +426,7 @@ async def ghl_sms_reply(request: Request):
         "reply": reply_text,
         "link_sent": link_sent,
         "first_name": first_name,
+        "handoff": _detect_handoff(reply_text),
     }
 
 
@@ -488,6 +505,78 @@ def _ig_human_active(contact_id: str) -> bool:
     except Exception as e:
         logger.warning("_ig_human_active failed (allowing AI to reply): %s", e)
         return False
+
+
+def _ig_fetch_history(contact_id: str) -> list:
+    """Pull recent message history from GHL so Bully AI has memory of prior turns.
+    Without this every reply is treated as the first message and the AI loops."""
+    if not contact_id:
+        return []
+    try:
+        from ghl import GHLClient
+        client = GHLClient()
+        return client.get_recent_messages(contact_id, limit=10)
+    except Exception as e:
+        logger.warning("_ig_fetch_history failed (continuing without history): %s", e)
+        return []
+
+
+# Phrases that indicate Bully AI is handing off to a human. When detected,
+# we tag the contact `pause-ai` + `needs-human` so future webhooks short-circuit,
+# and (optionally) ping Umar via SMS so he knows to jump in.
+_HANDOFF_PATTERNS = [
+    "i'll get umar",
+    "i'll have umar",
+    "umar will reach out",
+    "umar will text",
+    "umar's gonna handle",
+    "umar will handle",
+    "let me have umar",
+    "let me grab umar",
+    "team member will",
+    "have umar reach",
+    "umar can take it from here",
+    "i'll loop umar in",
+    "let me get a human",
+    "let me pull umar",
+]
+
+
+def _detect_handoff(reply_text: str) -> bool:
+    """True if Bully AI's reply promises a human handoff."""
+    if not reply_text:
+        return False
+    low = reply_text.lower()
+    return any(p in low for p in _HANDOFF_PATTERNS)
+
+
+def _do_handoff(contact_id: str, first_name: str, last_user_message: str) -> None:
+    """Tag the contact pause-ai + needs-human and ping Umar's phone."""
+    if not contact_id:
+        return
+    try:
+        from ghl import GHLClient
+        client = GHLClient()
+        try:
+            client.add_tags(contact_id, ["pause-ai", "needs-human"])
+            logger.info("Handoff: tagged %s with pause-ai + needs-human", contact_id)
+        except Exception as e:
+            logger.warning("Handoff tag failed for %s: %s", contact_id, e)
+
+        # Optional SMS ping to Umar's personal number (set UMAR_ALERT_PHONE in env).
+        # Falls back silently if not set.
+        umar_phone = os.getenv("UMAR_ALERT_PHONE", "")
+        if umar_phone and hasattr(client, "send_sms"):
+            try:
+                snippet = (last_user_message or "").strip()[:140]
+                client.send_sms(
+                    phone=umar_phone,
+                    message=f"[Bully AI handoff] {first_name or 'A user'} needs you. Last msg: \"{snippet}\"",
+                )
+            except Exception as e:
+                logger.warning("Handoff SMS to Umar failed: %s", e)
+    except Exception as e:
+        logger.warning("_do_handoff outer failure: %s", e)
 
 
 def _ig_route_intent(text: str) -> str:
@@ -619,8 +708,6 @@ async def ig_dm_router(request: Request):
     if ig_handle:
         custom["ig_handle"] = ig_handle
 
-    history = payload.get("history") or []
-
     logger.info("IG DM from %s (@%s): %r", first_name, ig_handle, message[:80])
 
     # Human-override check: if Umar manually replied recently, AI stays out of it.
@@ -634,22 +721,34 @@ async def ig_dm_router(request: Request):
             "ig_handle": ig_handle,
         }
 
+    # Pull conversation history from GHL so Bully AI has memory of prior turns.
+    # GHL webhooks don't pass history, so without this every reply restarts the convo.
+    history = payload.get("history") or _ig_fetch_history(contact_id)
+
     try:
         reply_text = bully_chat(user_message=message, contact_context=custom, history=history)
     except Exception:
         logger.exception("IG DM chat failed")
         reply_text = (
-            f"{(first_name + ' — ') if first_name else ''}give me a sec to pull your file 💪. "
+            f"{(first_name + ' ') if first_name else ''}give me a sec to pull your file. "
             "If you haven't yet, drop your reports at https://bullyaiagent.com/#upload"
         )
 
     sent = _ig_send_dm_safe(contact_id, reply_text)
+
+    # If Bully AI promised a human handoff, tag the contact + ping Umar so the
+    # conversation actually gets picked up instead of dying.
+    if _detect_handoff(reply_text):
+        logger.info("Handoff detected in reply for contact %s", contact_id)
+        _do_handoff(contact_id, first_name, message)
+
     return {
         "ok": True,
         "reply": reply_text,
         "first_name": first_name,
         "ig_handle": ig_handle,
         "sent_via_backend": bool(sent),
+        "handoff": _detect_handoff(reply_text),
     }
 
 

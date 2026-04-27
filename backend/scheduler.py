@@ -42,7 +42,15 @@ from typing import List, Optional
 
 logger = logging.getLogger("bureau-bullies.scheduler")
 
-DB_PATH = Path(os.getenv("BB_SCHEDULER_DB", "/tmp/bullies_scheduled_emails.json"))
+def _default_db_path() -> str:
+    """Pick a persistent path if /var/data exists (Render disk mount), else /tmp.
+    /tmp gets wiped on every redeploy, so /var/data is strongly preferred."""
+    if Path("/var/data").exists() and os.access("/var/data", os.W_OK):
+        return "/var/data/bullies_scheduled_emails.json"
+    return "/tmp/bullies_scheduled_emails.json"
+
+
+DB_PATH = Path(os.getenv("BB_SCHEDULER_DB", _default_db_path()))
 POLL_SECONDS = int(os.getenv("BB_SCHEDULER_POLL_SECONDS", "60"))
 
 # Cadence in seconds from scan time for each of the 7 emails.

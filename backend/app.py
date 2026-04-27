@@ -899,6 +899,231 @@ def admin_backfill_email_drip(token: str = Form("")):
     return {"ok": True, "contacts_enqueued": enqueued, "skipped": skipped}
 
 
+@app.post("/admin/dispatch-next")
+def admin_dispatch_next(token: str = Form(""), regenerate: str = Form("1")):
+    """Advance every bureau-scan contact by ONE email in their sequence.
+
+    For each contact tagged 'bureau-scan':
+      - Look at the scheduler DB to find the highest email_index already 'sent'.
+      - If max_sent == 0, send email 1. If max_sent == 1, send email 2. ... up to 7.
+      - Skip contacts whose entire sequence (1-7) is already sent.
+      - regenerate=1 (default): re-generate the email body fresh using the
+        current PAS framework, ignoring any old cr_email_N fields stored in GHL.
+      - regenerate=0: use the old stored cr_email_N_subject/body as-is.
+      - Send immediately via GHL Conversations API.
+      - Record a new scheduler row with status='sent' so this endpoint is idempotent.
+
+    Protected by ADMIN_TOKEN env var.
+    """
+    expected = os.getenv("ADMIN_TOKEN", "")
+    if not expected or token != expected:
+        return {"ok": False, "error": "unauthorized"}
+
+    from ghl import GHLClient
+    from email_generator import generate_email, GOAL_FRAMES
+    from datetime import datetime, timezone
+    import json as _json
+    from pathlib import Path as _Path
+
+    try:
+        client = GHLClient()
+    except Exception as e:
+        return {"ok": False, "error": f"ghl_init_failed: {e}"}
+
+    try:
+        contacts = client.search_contacts_by_tag("bureau-scan") if hasattr(client, "search_contacts_by_tag") else []
+    except Exception as e:
+        return {"ok": False, "error": f"search_failed: {e}"}
+
+    # Load scheduler DB to figure out per-contact max sent index
+    from scheduler import DB_PATH as _DB, _load_db, _save_db, _now_iso
+    rows = _load_db()
+    sent_index_by_contact: dict = {}
+    for r in rows:
+        if r.get("status") != "sent":
+            continue
+        cid = r.get("contact_id")
+        idx = r.get("email_index", 0)
+        if cid:
+            sent_index_by_contact[cid] = max(sent_index_by_contact.get(cid, 0), int(idx))
+
+    GOAL_LABELS = {
+        "house": "House",
+        "car": "Car",
+        "business": "Business",
+        "credit_card": "Credit Card",
+        "freedom": "Personal Freedom",
+        "peace": "Peace of Mind",
+    }
+
+    sent_now = 0
+    skipped = 0
+    failed = 0
+    sequence_complete = 0
+    no_email_addr = 0
+    no_scan_data = 0
+    new_rows: list = []
+
+    for c in contacts or []:
+        cid = c.get("id") or c.get("_id")
+        email_addr = c.get("email") or c.get("emailAddress")
+        if not cid:
+            skipped += 1
+            continue
+        if not email_addr:
+            no_email_addr += 1
+            continue
+
+        # Determine next email index
+        max_sent = sent_index_by_contact.get(cid, 0)
+        next_idx = max_sent + 1  # 1-indexed
+        if next_idx > 7:
+            sequence_complete += 1
+            continue
+
+        first_name = c.get("firstName") or c.get("first_name") or ""
+
+        # Reconstruct scan data + flat custom fields map
+        cf = c.get("customFields") or c.get("custom_field") or []
+        cf_map = {}
+        for item in cf:
+            k = item.get("fieldKey") or item.get("key") or item.get("name") or ""
+            v = item.get("value", "")
+            cf_map[k.replace("contact.", "")] = v
+
+        # Pick subject + body for this index
+        subject = ""
+        body = ""
+
+        if regenerate == "1":
+            # Regenerate fresh with current PAS framework
+            try:
+                scan_ctx = {
+                    "top_collection_name": cf_map.get("cr_top_collection_name", "your top collection"),
+                    "top_collection_amount": float(cf_map.get("cr_top_collection_amount", 0) or 0),
+                    "total_leverage": float(cf_map.get("cr_total_leverage", 0) or 0),
+                    "violations_count": int(float(cf_map.get("cr_violations_count", 0) or 0)),
+                    "fico_range": cf_map.get("cr_fico_range", "unknown"),
+                    "top_pain_point": cf_map.get("cr_top_pain_point", ""),
+                    "fear_hook": cf_map.get("cr_fear_hook", ""),
+                    "case_law_cited": cf_map.get("cr_case_law_cited", ""),
+                    "recommended_tier": cf_map.get("cr_recommended_tier", "toolkit"),
+                }
+                # If we have nothing usable, skip rather than send a generic email
+                if not scan_ctx["top_collection_name"] and not scan_ctx["violations_count"]:
+                    no_scan_data += 1
+                    continue
+
+                goal_key = (cf_map.get("cr_goal", "") or "freedom").strip().lower()
+                if goal_key not in GOAL_FRAMES:
+                    goal_key = "freedom"
+                goal_label = cf_map.get("cr_goal_label") or GOAL_LABELS.get(goal_key, "Personal Freedom")
+
+                generated = generate_email(
+                    consumer_first=first_name or "there",
+                    scan=scan_ctx,
+                    day_index=next_idx - 1,
+                    goal_key=goal_key,
+                    goal_label=goal_label,
+                )
+                subject = generated["subject"]
+                body = generated["body"]
+            except Exception as e:
+                logger.exception("dispatch-next: generate failed for %s: %s", cid, e)
+                failed += 1
+                continue
+        else:
+            subject = cf_map.get(f"cr_email_{next_idx}_subject", "")
+            body = cf_map.get(f"cr_email_{next_idx}_body", "")
+            if not subject or not body:
+                no_scan_data += 1
+                continue
+
+        # Send via GHL
+        try:
+            from scheduler import _append_signature_and_footer, _plaintext_to_html
+            body_with_sig = _append_signature_and_footer(body)
+            ok = client.send_email(
+                contact_id=cid,
+                subject=subject,
+                html=_plaintext_to_html(body_with_sig),
+                plain=body_with_sig,
+            )
+        except Exception as e:
+            logger.exception("dispatch-next: send failed for %s: %s", cid, e)
+            failed += 1
+            continue
+
+        # Record in scheduler DB so we don't double-send next time
+        new_rows.append({
+            "id": f"{cid}-{next_idx}-{int(datetime.now(timezone.utc).timestamp())}",
+            "contact_id": cid,
+            "contact_email": email_addr,
+            "first_name": first_name,
+            "email_index": next_idx,
+            "day": [0, 1, 3, 5, 7, 10, 14][next_idx - 1],
+            "subject": subject,
+            "body": body,
+            "send_at": _now_iso(),
+            "status": "sent" if ok else "failed",
+            "created_at": _now_iso(),
+            "dispatched_at": _now_iso(),
+            "source": "admin/dispatch-next",
+        })
+
+        if ok:
+            sent_now += 1
+            logger.info("dispatch-next sent email %d to %s (%s)", next_idx, first_name or "?", email_addr)
+        else:
+            failed += 1
+
+    # Persist all new rows in one save
+    if new_rows:
+        rows.extend(new_rows)
+        _save_db(rows)
+
+    return {
+        "ok": True,
+        "sent": sent_now,
+        "failed": failed,
+        "skipped": skipped,
+        "no_email_addr": no_email_addr,
+        "no_scan_data": no_scan_data,
+        "sequence_complete": sequence_complete,
+        "total_contacts_seen": len(contacts) if contacts else 0,
+        "regenerated": regenerate == "1",
+    }
+
+
+@app.get("/admin/scheduler-status")
+def admin_scheduler_status(token: str = ""):
+    """Quick read-only summary of the scheduler queue. Auth via ?token=..."""
+    expected = os.getenv("ADMIN_TOKEN", "")
+    if not expected or token != expected:
+        return {"ok": False, "error": "unauthorized"}
+    from scheduler import _load_db, DB_PATH as _DB
+    rows = _load_db()
+    summary = {"pending": 0, "sent": 0, "failed": 0, "cancelled": 0, "other": 0}
+    by_index = {}
+    contacts_seen = set()
+    for r in rows:
+        s = r.get("status", "other")
+        summary[s if s in summary else "other"] = summary.get(s if s in summary else "other", 0) + 1
+        idx = r.get("email_index", 0)
+        by_index[idx] = by_index.get(idx, 0) + 1
+        if r.get("contact_id"):
+            contacts_seen.add(r["contact_id"])
+    return {
+        "ok": True,
+        "db_path": str(_DB),
+        "db_persistent": str(_DB).startswith("/var/data"),
+        "rows_total": len(rows),
+        "by_status": summary,
+        "by_email_index": by_index,
+        "unique_contacts": len(contacts_seen),
+    }
+
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True}

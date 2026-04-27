@@ -982,7 +982,15 @@ def admin_dispatch_next(token: str = Form(""), regenerate: str = Form("1"), limi
     if max_batch <= 0:
         max_batch = 20
 
-    for c in contacts or []:
+    # Sort contacts so the LEAST-progressed ones come first.
+    # That way email 1 goes to ALL untouched contacts before anyone gets email 2.
+    def _max_sent_for(c):
+        cid = c.get("id") or c.get("_id") or ""
+        return sent_index_by_contact.get(cid, 0)
+
+    sorted_contacts = sorted(contacts or [], key=_max_sent_for)
+
+    for c in sorted_contacts:
         # Stop early if we've already processed `max_batch` contacts (any outcome).
         if (sent_now + failed + no_scan_data) >= max_batch:
             break

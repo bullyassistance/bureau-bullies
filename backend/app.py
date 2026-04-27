@@ -476,6 +476,20 @@ def _ig_send_dm_safe(contact_id: str, reply: str, *, comment_id: str = "") -> bo
         return False
 
 
+def _ig_human_active(contact_id: str) -> bool:
+    """Returns True if Umar has manually replied recently or the contact is
+    flagged pause-ai. Used to short-circuit auto-replies."""
+    if not contact_id:
+        return False
+    try:
+        from ghl import GHLClient
+        client = GHLClient()
+        return bool(client.is_human_active(contact_id))
+    except Exception as e:
+        logger.warning("_ig_human_active failed (allowing AI to reply): %s", e)
+        return False
+
+
 def _ig_route_intent(text: str) -> str:
     """Quick keyword router that decides if this is a 'free guide / ME' kickoff or a real conversation.
     Returns 'opener' (first contact, send the upload link) or 'conversation' (real chat)."""
@@ -609,6 +623,17 @@ async def ig_dm_router(request: Request):
 
     logger.info("IG DM from %s (@%s): %r", first_name, ig_handle, message[:80])
 
+    # Human-override check: if Umar manually replied recently, AI stays out of it.
+    contact_id = _ig_extract_contact_id(payload)
+    if _ig_human_active(contact_id):
+        logger.info("IG DM auto-reply skipped — human active for contact %s", contact_id)
+        return {
+            "ok": True,
+            "skipped": "human_active",
+            "first_name": first_name,
+            "ig_handle": ig_handle,
+        }
+
     try:
         reply_text = bully_chat(user_message=message, contact_context=custom, history=history)
     except Exception:
@@ -618,7 +643,6 @@ async def ig_dm_router(request: Request):
             "If you haven't yet, drop your reports at https://bullyaiagent.com/#upload"
         )
 
-    contact_id = _ig_extract_contact_id(payload)
     sent = _ig_send_dm_safe(contact_id, reply_text)
     return {
         "ok": True,
@@ -667,6 +691,12 @@ async def ig_nurture_router(request: Request):
         synthesized = f"[NURTURE TICK {tick} — they replied to an IG DM but haven't uploaded their report yet. Generate the appropriate {tick} follow-up message per the cadence playbook. Be warm, not pushy.]"
 
     logger.info("IG nurture %s for %s (uploaded=%s)", tick, first_name or ig_handle, has_uploaded)
+
+    # Human-override: if Umar's been chatting with them, don't fire nurture pings.
+    contact_id = _ig_extract_contact_id(payload)
+    if _ig_human_active(contact_id):
+        logger.info("IG nurture %s skipped — human active for contact %s", tick, contact_id)
+        return {"ok": True, "skipped": "human_active", "tick": tick}
 
     try:
         reply_text = bully_chat(user_message=synthesized, contact_context=custom, history=None)

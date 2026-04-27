@@ -378,7 +378,7 @@ def generate_full_sequence(
                     f"Following up on the report scan I ran for you. "
                     f"I found {scan.get('violations_count', 0)} violations worth about "
                     f"${scan.get('total_leverage', 0):.0f} in leverage — which means real "
-                    f"negotiating power against "{scan.get('top_collection_name', 'these collectors')}.\n\n"
+                    f"negotiating power against {scan.get('top_collection_name', 'these collectors')}.\n\n"
                     f"Want me to walk you through how to use it? Reply YES.\n\n"
                     "— Bully AI"
                 ),

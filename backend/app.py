@@ -913,7 +913,7 @@ def _check_admin(token: str) -> bool:
 
 
 @app.post("/admin/dispatch-next")
-def admin_dispatch_next(token: str = Form(""), regenerate: str = Form("1")):
+def admin_dispatch_next(token: str = Form(""), regenerate: str = Form("1"), limit: str = Form("20")):
     """Advance every bureau-scan contact by ONE email in their sequence.
 
     For each contact tagged 'bureau-scan':
@@ -975,8 +975,17 @@ def admin_dispatch_next(token: str = Form(""), regenerate: str = Form("1")):
     no_email_addr = 0
     no_scan_data = 0
     new_rows: list = []
+    try:
+        max_batch = int(limit)
+    except Exception:
+        max_batch = 20
+    if max_batch <= 0:
+        max_batch = 20
 
     for c in contacts or []:
+        # Stop early if we've already processed `max_batch` contacts (any outcome).
+        if (sent_now + failed + no_scan_data) >= max_batch:
+            break
         cid = c.get("id") or c.get("_id")
         email_addr = c.get("email") or c.get("emailAddress")
         if not cid:
@@ -1089,10 +1098,12 @@ def admin_dispatch_next(token: str = Form(""), regenerate: str = Form("1")):
         else:
             failed += 1
 
-    # Persist all new rows in one save
-    if new_rows:
-        rows.extend(new_rows)
-        _save_db(rows)
+        # Persist after every contact so partial completions survive a timeout
+        try:
+            rows.append(new_rows[-1])
+            _save_db(rows)
+        except Exception as e:
+            logger.warning("dispatch-next: incremental save failed: %s", e)
 
     return {
         "ok": True,

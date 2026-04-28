@@ -113,7 +113,8 @@ async def scan(
     lastName:  str = Form(...),
     email:     str = Form(...),
     phone:     str = Form(...),
-    goal:      str = Form("freedom"),   # NEW — what they're trying to unlock
+    goal:      str = Form("freedom"),   # what they're trying to unlock
+    ig_handle: str = Form(""),          # NEW — optional IG handle for DM follow-up
     reports:   List[UploadFile] = File(...),
 ):
     if not reports:
@@ -179,6 +180,17 @@ async def scan(
         custom_fields["cr_goal"] = goal_key
         custom_fields["cr_goal_label"] = goal_label
 
+        # Capture IG handle if provided so we can DM them the breakdown.
+        # Strip leading @ and any URL prefix so the bare handle is stored.
+        ig_clean = (ig_handle or "").strip().lstrip("@").strip()
+        if ig_clean:
+            # Strip URL forms: instagram.com/foo, https://www.instagram.com/foo/
+            import re as _re
+            m = _re.search(r"(?:instagram\.com/)?([A-Za-z0-9_.]{1,30})", ig_clean)
+            if m:
+                ig_clean = m.group(1).lower()
+            custom_fields["ig_handle"] = ig_clean
+
         # ---- Generate 7-email tailored nurture drip ---------------------
         try:
             scan_ctx = {
@@ -218,6 +230,29 @@ async def scan(
             logger.error("GHL push failed (non-fatal): %s", e)
         except Exception as e:
             logger.exception("GHL push unexpected error: %s", e)
+
+        # ---- IG DM the scan breakdown (when handle was provided) -------
+        # Mirrors the SMS+email sequence on a third channel: as soon as the
+        # scan finishes, Bully AI fires a personalized DM to their IG handle
+        # with the top collection by name+amount, total leverage, and the
+        # transformation pitch tied to their goal. Same tier-recommendation
+        # ladder runs in subsequent IG replies via /webhooks/ig/dm.
+        try:
+            if ig_clean and ghl_result:
+                contact_id_for_ig = (ghl_result.get("contact") or ghl_result).get("id") \
+                                  or (ghl_result.get("contact") or ghl_result).get("_id") or ""
+                if contact_id_for_ig:
+                    dm_body = _build_scan_breakdown_dm(
+                        first_name=firstName,
+                        ig_handle=ig_clean,
+                        summary=summary,
+                        goal_key=goal_key,
+                        goal_label=goal_label,
+                    )
+                    sent = _ig_send_dm_safe(contact_id_for_ig, dm_body)
+                    logger.info("IG DM sent to @%s after scan: %s", ig_clean, "ok" if sent else "FAILED")
+        except Exception as e:
+            logger.exception("IG DM after scan failed (non-fatal): %s", e)
 
         # ---- Schedule the 7-email drip (backend-driven, no GHL workflow needed)
         try:
@@ -616,6 +651,50 @@ def _ig_send_dm_safe(contact_id: str, reply: str, *, comment_id: str = "") -> bo
     except Exception as e:
         logger.warning("_ig_send_dm_safe failed: %s", e)
         return False
+
+
+def _build_scan_breakdown_dm(first_name: str, ig_handle: str, summary, goal_key: str, goal_label: str) -> str:
+    """Personalized IG DM fired immediately after a scan completes when the user
+    provided their IG handle. Mirrors the close-ladder Stage 1 (transformation +
+    specifics): top collection by name+amount, total leverage, transformation
+    phrase tied to their goal, and the recommended tier.
+
+    Subsequent IG replies route through /webhooks/ig/dm and get the full
+    Transformation → Fear → Discount close ladder via Bully AI's system prompt.
+    """
+    fn = (first_name or "there").strip()
+    top_name   = getattr(summary, "top_collection_name", None) or "your biggest collection"
+    top_amt    = getattr(summary, "top_collection_amount", 0) or 0
+    leverage   = getattr(summary, "total_estimated_leverage", 0) or 0
+    violations = len(getattr(summary, "violations", []) or [])
+    tier       = (getattr(summary, "recommended_tier", "") or "").lower()
+
+    transformation = {
+        "house":        "Get this gone and you're 90 days from keys at the closing table on the rate other people get, not the rate banks charge stressed credit.",
+        "car":          "Get this gone and you're walking off the lot in your name, on a 5% APR instead of 18.",
+        "business":     "Get this gone and the EIN funding doors actually open. Net-30 vendors say yes instead of laughing.",
+        "credit_card":  "Get this gone and we're talking real Amex, real Chase Sapphire — not a $300 secured card.",
+        "freedom":      "Get this gone and the phone stops ringing. The mail stops being a threat.",
+        "peace":        "Get this gone and you sleep through the night without thinking about your score.",
+    }.get(goal_key, "Get this gone and your goal moves from theoretical to inevitable.")
+
+    if tier in ("dfy", "tier_dfy", "done_for_you"):
+        tier_pitch = "DFY makes sense for your file size, $2,500 paid in full or $229/mo indefinite. Squad runs every dispute for you."
+    elif tier in ("vault", "dispute_vault", "tier_vault"):
+        tier_pitch = "Dispute Vault is the move, $66 one-time. Letters pre-written for the violations on your file, you mail certified."
+    else:
+        tier_pitch = "Collection Toolkit is your starting point, $17 one-time. DIY playbook for the validation letter that kills this account."
+
+    amt_str = f"${top_amt:,.0f}" if top_amt else ""
+    leverage_str = f"${leverage:,.0f}" if leverage else ""
+
+    body = (
+        f"Hey {fn}, Bully AI here. Just ran your file. Here's the breakdown:\n\n"
+        f"The play is your {top_name} {amt_str} account. Out of {violations} violations and {leverage_str} in total leverage on your report, this one is the priority.\n\n"
+        f"{transformation}\n\n"
+        f"{tier_pitch} What's your move?"
+    )
+    return body
 
 
 def _ig_human_active(contact_id: str) -> bool:

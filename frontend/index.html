@@ -585,6 +585,10 @@
           <input id="phone" name="phone" type="tel" placeholder="(555) 000-0000" required />
         </div>
         <div class="field field-full">
+          <label for="ig_handle">Instagram handle (optional, so I can DM you the breakdown)</label>
+          <input id="ig_handle" name="ig_handle" type="text" placeholder="@yourhandle" autocomplete="off" />
+        </div>
+        <div class="field field-full">
           <label for="goal">What are you trying to unlock?</label>
           <select id="goal" name="goal" required>
             <option value="" disabled selected>Pick the one that hits hardest</option>
@@ -872,6 +876,7 @@ document.querySelectorAll('[data-reveal]').forEach(el => io.observe(el));
     const em   = get('email');
     const ph   = get('phone');
     const goal = get('goal');
+    const igh  = get('ig')    || get('ig_handle');
     const src  = get('utm_source') || get('source') || '';
     const cid  = get('cid') || get('contact_id') || '';
 
@@ -879,6 +884,7 @@ document.querySelectorAll('[data-reveal]').forEach(el => io.observe(el));
     if (ln)   document.getElementById('lname').value = ln;
     if (em)   document.getElementById('email').value = em;
     if (ph)   document.getElementById('phone').value = ph;
+    if (igh)  document.getElementById('ig_handle').value = igh.replace(/^@/, '');
     if (goal) {
       const sel = document.getElementById('goal');
       const allowed = Array.from(sel.options).map(o => o.value);

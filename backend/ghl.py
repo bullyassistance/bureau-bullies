@@ -422,21 +422,33 @@ class GHLClient:
         return False
 
     # ---- Human-override detection ---------------------------------------
-    def is_human_active(self, contact_id: str) -> bool:
+    def is_human_active(self, contact_id: str, auto_tag: bool = True) -> bool:
         """
         Returns True if a human (Umar) has been active in this conversation
-        and the AI should stand down. Two signals:
+        and the AI should stand down — PERMANENTLY for this contact.
 
-          1. Contact has a "pause-ai" / "manual-mode" / "human-active" tag
-          2. The most recent OUTBOUND message in the conversation was sent
-             by a human user (source != api/automation/integration)
+        Three signals (any one triggers True):
+          1. Contact has a "pause-ai" / "manual-mode" / "human-active" tag.
+          2. ANY of the last 30 outbound messages was sent by a human (not API/automation).
+             We scan ALL recent outbounds, not just the most recent — because the AI
+             might have already squeaked in a reply AFTER the human took over (race
+             condition), which would otherwise mask the human's intervention.
+          3. Any of the last 30 outbound messages contains takeover language like
+             "this is umar", "umar here", "i'll take it from here" — covers the case
+             where Umar replied via IG native (which doesn't always tag the message
+             as manual in GHL's outbound feed).
 
-        If either is True, we don't auto-reply.
+        SIDE EFFECT (if auto_tag=True): when signal 2 or 3 fires, this method
+        automatically applies the `pause-ai` tag to the contact so future webhook
+        checks short-circuit instantly without re-scanning the conversation.
+        This is the critical fix for the Ebony loop — once Umar takes over, AI
+        never replies again, even if the AI message squeaked in first.
         """
         if not contact_id:
             return False
 
-        # ---- Signal 1: tag check ----
+        # ---- Signal 1: tag check (cheap, do it first) ----
+        already_tagged = False
         try:
             if self.version == "v1":
                 url = f"{V1_BASE}/contacts/{contact_id}"
@@ -445,17 +457,16 @@ class GHLClient:
             r = requests.get(url, headers=self._headers, timeout=10)
             if r.ok:
                 contact = r.json().get("contact") or r.json() or {}
-                tags = contact.get("tags") or []
+                tags = [str(t).lower() for t in (contact.get("tags") or [])]
                 pause_tags = {"pause-ai", "manual-mode", "human-active", "ai-off"}
-                if any(t.lower() in pause_tags for t in tags):
+                if any(t in pause_tags for t in tags):
                     logger.info("is_human_active: pause-ai tag found on %s", contact_id)
                     return True
         except Exception as e:
             logger.warning("is_human_active tag check failed: %s", e)
 
-        # ---- Signal 2: last outbound message source ----
+        # ---- Signal 2 & 3: scan recent outbounds ----
         try:
-            # Find conversation
             if self.version == "v2":
                 conv_url = f"{V2_BASE}/conversations/search"
                 r = requests.post(
@@ -465,7 +476,6 @@ class GHLClient:
                     timeout=10,
                 )
             else:
-                # v1 doesn't have a clean conv search by contact, skip signal 2
                 return False
 
             if not r.ok:
@@ -477,31 +487,60 @@ class GHLClient:
             if not conv_id:
                 return False
 
-            # Get last 10 messages
+            # Get last 30 messages — wider window so a human reply isn't masked
+            # by a follow-up AI reply that beat it to the punch.
             msg_url = f"{V2_BASE}/conversations/{conv_id}/messages"
-            r = requests.get(msg_url, headers=self._headers, params={"limit": 10}, timeout=10)
+            r = requests.get(msg_url, headers=self._headers, params={"limit": 30}, timeout=10)
             if not r.ok:
                 return False
             data = r.json()
             messages = (data.get("messages") or {}).get("messages") or data.get("messages") or []
 
-            # Look at outbound messages from newest to oldest
-            for msg in messages[:10]:
+            ai_sources = {"api", "integration", "automation", "workflow", "bot"}
+            takeover_phrases = (
+                "this is umar", "umar here", "this is the real umar",
+                "i'll take it from here", "i'll take over from here",
+                "let me jump in", "real umar speaking",
+                "ai off", "stop ai", "pause ai", "taking over",
+            )
+
+            human_signal_found = False
+            human_source = ""
+            for msg in messages:
                 direction = (msg.get("direction") or msg.get("type") or "").lower()
-                source = (msg.get("source") or msg.get("messageType") or "").lower()
-                user_id = msg.get("userId") or msg.get("user_id") or ""
                 if "outbound" not in direction:
                     continue
-                # AI sends via API → source contains 'api' / 'integration' / 'automation' / 'workflow'
-                ai_sources = {"api", "integration", "automation", "workflow", "bot"}
-                if any(s in source for s in ai_sources):
-                    # AI sent this — keep looking; if first outbound is AI, allow auto-reply
-                    return False
-                # Otherwise this was a human (agent/manual/UI send) → pause AI
+                source = (msg.get("source") or msg.get("messageType") or "").lower()
+                body_l = (
+                    str(msg.get("body") or msg.get("text") or msg.get("message") or "")
+                ).lower()
+
+                # Signal 2: outbound from a non-API source = human
+                is_api_source = any(s in source for s in ai_sources)
+                if not is_api_source and source:
+                    # Non-empty source that isn't api/automation = human reply
+                    human_signal_found = True
+                    human_source = source
+                    break
+
+                # Signal 3: takeover language in body, regardless of source
+                if any(p in body_l for p in takeover_phrases):
+                    human_signal_found = True
+                    human_source = "takeover-phrase"
+                    break
+
+            if human_signal_found:
                 logger.info(
-                    "is_human_active: human outbound found (source=%s, userId=%s) — pausing AI",
-                    source, user_id,
+                    "is_human_active: human reply found in last 30 outbounds (source=%s) for %s",
+                    human_source, contact_id,
                 )
+                # Apply pause-ai tag so future checks short-circuit instantly
+                if auto_tag:
+                    try:
+                        self.add_tags(contact_id, ["pause-ai"])
+                        logger.info("is_human_active: auto-applied pause-ai tag to %s", contact_id)
+                    except Exception as e:
+                        logger.warning("is_human_active: could not apply pause-ai tag: %s", e)
                 return True
         except Exception as e:
             logger.warning("is_human_active conversation check failed: %s", e)

@@ -498,10 +498,20 @@ class GHLClient:
 
             ai_sources = {"api", "integration", "automation", "workflow", "bot"}
             takeover_phrases = (
-                "this is umar", "umar here", "this is the real umar",
-                "i'll take it from here", "i'll take over from here",
-                "let me jump in", "real umar speaking",
-                "ai off", "stop ai", "pause ai", "taking over",
+                # Direct identity signals
+                "this is umar", "umar here", "this is the real umar", "real umar speaking",
+                # Hand-off intent
+                "i'll take it from here", "i'll take over from here", "let me jump in", "taking over",
+                "ai off", "stop ai", "pause ai", "ai stop",
+                # Umar's actual voice patterns from production threads
+                "safe travels", "lmk when", "lmk when you're", "hit me up when",
+                "ill do it $", "i'll do it $", "old price", "doubled the work", "twice the work",
+                "bro that was", "bro this", "let's do it", "$1500 bro", "$1,500 bro",
+                "$2000 bro", "$2,000 bro", "send me", "shoot me",
+                # Direct payment/contract language
+                "send the cash app", "venmo", "zelle me", "send to my", "card link",
+                # Personal acknowledgments
+                "appreciate you", "i appreciate you", "got you", "i got you",
             )
 
             human_signal_found = False
@@ -518,7 +528,6 @@ class GHLClient:
                 # Signal 2: outbound from a non-API source = human
                 is_api_source = any(s in source for s in ai_sources)
                 if not is_api_source and source:
-                    # Non-empty source that isn't api/automation = human reply
                     human_signal_found = True
                     human_source = source
                     break
@@ -527,6 +536,14 @@ class GHLClient:
                 if any(p in body_l for p in takeover_phrases):
                     human_signal_found = True
                     human_source = "takeover-phrase"
+                    break
+
+                # Signal 4: dollar-amount price negotiation (Umar's lane, AI stays out)
+                # Match $1500, $1,500, $2000, $2,000 etc as standalone or with "bro"
+                import re as _re
+                if _re.search(r"\$\s?\d{3,5}(?:,\d{3})?(?:\s|$|\.|!|\?|bro\b)", body_l):
+                    human_signal_found = True
+                    human_source = "price-negotiation"
                     break
 
             if human_signal_found:

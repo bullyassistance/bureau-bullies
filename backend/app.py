@@ -21,6 +21,7 @@ import secrets
 import shutil
 import tempfile
 from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -31,7 +32,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from analyzer import analyze_report, summary_to_ghl_fields
-from bully_ai import chat as bully_chat
+from bully_ai import chat as bully_chat, detect_qualification_signals, detect_already_scanned, extract_email
 from docgen import generate_report_doc
 from ghl import push_lead_to_ghl, GHLError
 from email_generator import generate_full_sequence, emails_to_ghl_fields, GOAL_FRAMES
@@ -385,9 +386,66 @@ async def ghl_sms_reply(request: Request):
 
     history = payload.get("history") or _ig_fetch_history(contact_id)
 
+    # Already-scanned reconciliation — same fix as the IG webhook. If the SMS
+    # reply contains an email, look up the contact and load their scan data.
+    custom = _enrich_context_with_already_scanned(message, custom)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Determine lead_stage from tags so Bully AI activates the right mode.
+    # Stages (mutually exclusive, checked in this priority order):
+    #   - qualified-no-upload → text-based intake fallback
+    #   - bureau-scan-completed → standard PAS / upsell mode
+    #   - qualifier-cold        → qualifier mode
+    # ─────────────────────────────────────────────────────────────────────
+    tags_lower = [str(t).lower() for t in (payload.get("tags") or contact_block.get("tags") or [])]
+
+    if "qualified-no-upload" in tags_lower:
+        custom["lead_stage"] = "qualified-no-upload"
+    elif "bureau-scan-completed" in tags_lower:
+        custom["lead_stage"] = "bureau-scan-completed"
+    elif "qualifier-cold" in tags_lower or "fb-form-backfill" in tags_lower:
+        custom["lead_stage"] = "qualifier-cold"
+
+    # Qualification detection runs only in qualifier-cold stage
+    is_qualifier_cold = (custom.get("lead_stage") == "qualifier-cold") and ("qualified" not in tags_lower)
+
+    qualification = {"is_qualified": False}
+    if is_qualifier_cold:
+        qualification = detect_qualification_signals(message)
+        if qualification["is_qualified"] and contact_id:
+            try:
+                from ghl import GHLClient
+                _qclient = GHLClient()
+                tags_to_add = ["qualified"]
+                _qclient.add_tags(contact_id, tags_to_add)
+                # Update structured custom fields so future merge tags + downstream
+                # workflow steps can use them.
+                cf = {}
+                if qualification.get("biggest_debt"):
+                    cf["biggest_debt"] = qualification["biggest_debt"]
+                if qualification.get("goal"):
+                    cf["goal"] = qualification["goal"]
+                if qualification.get("timeline"):
+                    cf["timeline"] = qualification["timeline"]
+                cf["qualified_at"] = datetime.now(timezone.utc).isoformat()
+                # Lightweight upsert just to set custom fields without changing tags
+                if hasattr(_qclient, "update_contact_fields"):
+                    _qclient.update_contact_fields(contact_id, cf)
+                logger.info("Qualified contact %s — debt=%s goal=%s timeline=%s",
+                            contact_id, qualification.get("biggest_debt"),
+                            qualification.get("goal"), qualification.get("timeline"))
+            except Exception as e:
+                logger.warning("Could not apply qualified tag/fields: %s", e)
+        # Inject qualification context for Bully AI's reply
+        if qualification.get("biggest_debt"):
+            custom["qualifier_named_debt"] = qualification["biggest_debt"]
+        if qualification.get("goal"):
+            custom["qualifier_named_goal"] = qualification["goal"]
+
     logger.info(
-        "SMS reply from %s: %r  (ctx keys: %s, history turns: %d)",
-        first_name or "unknown", message[:80], list(custom.keys())[:8], len(history)
+        "SMS reply from %s: %r  (ctx keys: %s, history turns: %d, qualified=%s)",
+        first_name or "unknown", message[:80], list(custom.keys())[:8],
+        len(history), qualification.get("is_qualified", False)
     )
 
     try:
@@ -428,6 +486,73 @@ async def ghl_sms_reply(request: Request):
         "first_name": first_name,
         "handoff": _detect_handoff(reply_text),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Already-scanned reconciliation — fixes the IG loop where a user who already
+# uploaded gets the upload link sent to them again. Two failure paths:
+#   1. They DM from an IG handle that doesn't match their bullyaiagent.com email
+#      → no contact match → no scan data in context → AI sends upload link.
+#   2. We have a contact match but the scan custom fields aren't populated yet
+#      → AI doesn't know what to reference.
+# Fix: detect "I uploaded" claims, ask for email, look up GHL contact by email,
+# inject their scan data into Bully AI's context for the rest of the thread.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _enrich_context_with_already_scanned(message: str, custom: dict) -> dict:
+    """Mutates `custom` dict to add already-scanned signals + scan data when
+    we can resolve the user's identity by email. Returns the enriched dict.
+
+    Behavior:
+      - If user's message contains an email AND we don't already have scan data:
+        look up the GHL contact by email, pull cr_* fields, add to custom.
+      - If user claims to have scanned but we still don't have scan data:
+        set custom["lead_stage"] = "claims-scanned-no-data" so Bully AI's
+        ALREADY-SCANNED MODE asks them for email + full name.
+      - If we have scan data (cr_violations_count present): set
+        custom["lead_stage"] = "scan-loaded" so Bully AI runs FEAR+URGENCY MODE.
+    """
+    if not isinstance(custom, dict):
+        custom = dict(custom or {})
+
+    has_scan_data = any(
+        (k.startswith("cr_") or k in ("biggest_debt", "total_leverage"))
+        and v not in (None, "", 0, "0")
+        for k, v in custom.items()
+    )
+
+    # Try to harvest an email from the message and look it up
+    email = extract_email(message or "")
+    if email and not has_scan_data:
+        try:
+            from ghl import GHLClient
+            client = GHLClient()
+            scan_ctx = client.get_scan_context_by_email(email) if hasattr(client, "get_scan_context_by_email") else {}
+            if scan_ctx:
+                # Merge — user's existing context wins for non-cr fields, scan data wins for cr_*
+                for k, v in scan_ctx.items():
+                    if k.startswith("cr_") or k in ("first_name", "matched_contact_id", "goal", "biggest_debt"):
+                        custom[k] = v
+                logger.info("Reconciled scan via email %s — keys added: %s", email, list(scan_ctx.keys())[:8])
+                # Re-check after enrichment
+                has_scan_data = any(
+                    (k.startswith("cr_") or k in ("biggest_debt", "total_leverage"))
+                    and v not in (None, "", 0, "0")
+                    for k, v in custom.items()
+                )
+        except Exception as e:
+            logger.warning("Email-based scan lookup failed for %s: %s", email, e)
+
+    claims_scanned = detect_already_scanned(message or "")
+
+    if has_scan_data:
+        custom["lead_stage"] = "scan-loaded"
+        custom["mode_hint"] = "fear-urgency"
+    elif claims_scanned:
+        custom["lead_stage"] = "claims-scanned-no-data"
+        custom["mode_hint"] = "ask-for-email"
+
+    return custom
 
 
 def _ig_as_string(v) -> str:
@@ -709,6 +834,11 @@ async def ig_dm_router(request: Request):
         custom["ig_handle"] = ig_handle
 
     logger.info("IG DM from %s (@%s): %r", first_name, ig_handle, message[:80])
+
+    # Already-scanned reconciliation — if they claim to have uploaded, harvest
+    # email from their message, look up the GHL contact, pull scan data into
+    # context. Without this, Bully AI sends the upload link in a loop.
+    custom = _enrich_context_with_already_scanned(message, custom)
 
     # Human-override check: if Umar manually replied recently, AI stays out of it.
     contact_id = _ig_extract_contact_id(payload)
@@ -1152,6 +1282,387 @@ def admin_scheduler_status(token: str = ""):
         "by_email_index": by_index,
         "unique_contacts": len(contacts_seen),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cold-lead qualifier — backfill + first-touch fire
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Story: 122+ FB/IG form leads sat in Meta Lead Center because the existing
+# GHL workflow had a broken Form Is filter. We need to (a) bulk-import them
+# into GHL, (b) enroll them into the (now-fixed) qualifier workflow, and (c)
+# fire the first SMS+email immediately so they're not dead-on-arrival.
+#
+# Input formats supported:
+#   - CSV upload (Meta Lead Center export shape: full_name, email, phone, ...)
+#   - JSON array of {first_name, last_name, email, phone, goal?, source?}
+#
+# Tags applied:
+#   - "fb-form-backfill" — so this batch is auditable
+#   - "qualifier-cold"   — so the qualifier workflow's tag-add trigger fires
+#
+# Idempotency: GHL upsert is idempotent on email+phone, so re-running the
+# same CSV is safe. We track per-contact "qualifier-fired-at" custom field
+# to avoid re-firing SMS #1 on the same lead.
+
+_QUALIFIER_SMS_1 = (
+    "Hey {fn}, Umar from Bureau Bullies. Saw you grabbed the 3 Day Challenge. "
+    "Quick question before I send anything — what's the #1 thing on your "
+    "credit report you want gone? Collection, late, charge-off, repo, or "
+    "something else?"
+)
+
+_QUALIFIER_EMAIL_1_SUBJECT = "{fn}, before I help you, one question"
+_QUALIFIER_EMAIL_1_BODY = (
+    "Hi {fn},\n\n"
+    "Umar from Bureau Bullies. You filled out the 3 Day Challenge a few minutes "
+    "ago, so I just sent you a quick text too.\n\n"
+    "Before I send you anything else, I need to know one thing — what's the #1 "
+    "item on your credit report you want gone? Most people I work with have "
+    "one specific account that's eating their score: a collection from "
+    "Portfolio Recovery, a charge-off from Capital One, a repo, a 90-day late "
+    "from a hospital bill. Tell me yours and I'll send you the exact playbook "
+    "for that account.\n\n"
+    "You can reply right to this email, or text me back at the number that "
+    "just texted you. Same person, same response.\n\n"
+    "Talk soon,\n"
+    "Umar\n"
+    "Bureau Bullies LLC"
+)
+
+
+def _parse_csv_leads(csv_text: str) -> list:
+    """Parse a Meta Lead Center CSV. Tolerates several common column shapes.
+
+    Meta exports vary: some have 'full_name', some 'first_name'+'last_name',
+    some 'phone_number' vs 'phone', etc. We normalize to {fn, ln, email, phone, goal}.
+    """
+    import csv as _csv
+    import io as _io
+    out = []
+    if not csv_text or not csv_text.strip():
+        return out
+    reader = _csv.DictReader(_io.StringIO(csv_text))
+    for row in reader:
+        # Lowercase keys for forgiving matching
+        rl = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
+
+        fn = rl.get("first_name") or rl.get("firstname") or rl.get("fname") or ""
+        ln = rl.get("last_name")  or rl.get("lastname")  or rl.get("lname") or ""
+        if not fn and rl.get("full_name"):
+            parts = rl["full_name"].split(" ", 1)
+            fn = parts[0]
+            ln = parts[1] if len(parts) > 1 else ""
+
+        email = rl.get("email") or rl.get("email_address") or ""
+        phone = rl.get("phone") or rl.get("phone_number") or rl.get("mobile") or ""
+
+        goal = (rl.get("goal") or rl.get("what_are_you_trying_to_unlock") or "").lower().strip()
+        # Map free-text goals to our canonical set when possible
+        if goal:
+            for canonical in ("house", "car", "business", "credit_card", "freedom", "peace"):
+                if canonical.replace("_", " ") in goal or canonical in goal:
+                    goal = canonical
+                    break
+
+        if not email and not phone:
+            continue  # can't reach them, skip
+
+        out.append({
+            "fn": fn, "ln": ln, "email": email, "phone": phone, "goal": goal,
+            "source": rl.get("source") or rl.get("ad_name") or "fb-form-backfill",
+        })
+    return out
+
+
+def _send_qualifier_first_touch(client, contact_id: str, fn: str, email: str, phone: str) -> dict:
+    """Fire SMS #1 and Email #1 of the cold-lead qualifier sequence.
+
+    Returns a dict with sms_ok / email_ok flags so the caller can audit.
+    """
+    result = {"sms_ok": False, "email_ok": False, "errors": []}
+    fn_safe = (fn or "there").strip()
+
+    # SMS #1 — only if we have a phone number
+    if phone:
+        try:
+            sms_body = _QUALIFIER_SMS_1.format(fn=fn_safe)
+            ok = client.send_sms(contact_id=contact_id, message=sms_body) if hasattr(client, "send_sms") else False
+            result["sms_ok"] = bool(ok)
+        except Exception as e:
+            result["errors"].append(f"sms: {e}")
+
+    # Email #1 — only if we have an email address
+    if email:
+        try:
+            subj = _QUALIFIER_EMAIL_1_SUBJECT.format(fn=fn_safe)
+            plain = _QUALIFIER_EMAIL_1_BODY.format(fn=fn_safe)
+            # Reuse the scheduler's signature/footer + html conversion
+            from scheduler import _append_signature_and_footer, _plaintext_to_html
+            plain_full = _append_signature_and_footer(plain)
+            html_full = _plaintext_to_html(plain_full)
+            ok = client.send_email(
+                contact_id=contact_id,
+                subject=subj,
+                html=html_full,
+                plain=plain_full,
+            )
+            result["email_ok"] = bool(ok)
+        except Exception as e:
+            result["errors"].append(f"email: {e}")
+
+    return result
+
+
+@app.post("/admin/backfill-leads")
+async def admin_backfill_leads(
+    token: str = Form(""),
+    fire_first_touch: str = Form("1"),
+    csv_text: str = Form(""),
+    workflow_id: str = Form(""),
+    limit: str = Form("50"),
+):
+    """Bulk-import cold form leads into GHL and (optionally) fire SMS #1 + Email #1.
+
+    POST as application/x-www-form-urlencoded:
+      token=<admin>
+      csv_text=<paste of the Meta Lead Center CSV export>
+      fire_first_touch=1   # send the qualifier first touch immediately
+      workflow_id=<ghl_id> # optional, also enrolls into a specific workflow
+      limit=50             # safety cap, no more than this many per call
+
+    Returns a summary so you can audit and re-run if needed.
+    """
+    if not _check_admin(token):
+        return {"ok": False, "error": "unauthorized"}
+
+    try:
+        max_n = int(limit)
+    except Exception:
+        max_n = 50
+    if max_n <= 0 or max_n > 500:
+        max_n = 50
+
+    leads = _parse_csv_leads(csv_text)
+    if not leads:
+        return {"ok": False, "error": "no_leads_parsed", "hint": "Paste the CSV body in csv_text. Must include header row."}
+
+    leads = leads[:max_n]
+
+    from ghl import GHLClient
+    from datetime import datetime, timezone
+    try:
+        client = GHLClient()
+    except Exception as e:
+        return {"ok": False, "error": f"ghl_init_failed: {e}"}
+
+    upserted = 0
+    fired_sms = 0
+    fired_email = 0
+    enrolled = 0
+    errors = []
+    audit = []
+
+    for lead in leads:
+        fn = lead["fn"]
+        ln = lead["ln"]
+        email = lead["email"]
+        phone = lead["phone"]
+        goal = lead["goal"]
+        src = lead["source"]
+
+        try:
+            tags = ["fb-form-backfill", "qualifier-cold"]
+            cf = {}
+            if goal:
+                cf["goal"] = goal
+            cf["lead_source"] = src or "fb-form-backfill"
+            cf["qualifier_fired_at"] = datetime.now(timezone.utc).isoformat()
+
+            resp = client.upsert_contact(
+                first_name=fn, last_name=ln,
+                email=email, phone=phone,
+                custom_fields=cf, tags=tags,
+            )
+            cid = (resp.get("contact") or resp).get("id") or (resp.get("contact") or resp).get("_id")
+            upserted += 1
+
+            entry = {"contact_id": cid, "name": f"{fn} {ln}".strip(), "email": email, "phone": phone}
+
+            if workflow_id and cid:
+                try:
+                    client.add_to_workflow(cid, workflow_id)
+                    enrolled += 1
+                    entry["workflow_enrolled"] = True
+                except Exception as we:
+                    entry["workflow_error"] = str(we)[:200]
+
+            if fire_first_touch == "1" and cid:
+                touch = _send_qualifier_first_touch(client, cid, fn, email, phone)
+                if touch["sms_ok"]:
+                    fired_sms += 1
+                if touch["email_ok"]:
+                    fired_email += 1
+                if touch["errors"]:
+                    entry["touch_errors"] = touch["errors"]
+
+            audit.append(entry)
+        except Exception as e:
+            errors.append({"lead": f"{fn} {ln} {email or phone}", "error": str(e)[:300]})
+
+    return {
+        "ok": True,
+        "leads_parsed": len(leads),
+        "upserted": upserted,
+        "enrolled_in_workflow": enrolled,
+        "first_touch_sms_sent": fired_sms,
+        "first_touch_email_sent": fired_email,
+        "errors": errors[:20],
+        "audit_first_20": audit[:20],
+        "hint": "Re-running this is safe (GHL upsert is idempotent on email+phone). qualifier_fired_at custom field tracks who got SMS #1.",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Non-uploader fallback — day 4 pivot to text-based intake
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Story: some leads will reply, qualify, get the upload link, and still not
+# upload. Don't let them die. Day 4 we pivot to: "just text me your top 3
+# collections, I'll write the play in chat." Lower friction by 90%, captures
+# the leads who don't want to leave SMS.
+
+_NON_UPLOADER_SMS = (
+    "{fn}, no pressure on the upload. Faster path: just text me your top 3 "
+    "collections, collector name and balance. I'll write your dispute plan "
+    "right here in chat. No site, no form."
+)
+
+
+@app.post("/admin/check-non-uploaders")
+def admin_check_non_uploaders(
+    token: str = Form(""),
+    days_since_qualified: str = Form("4"),
+    limit: str = Form("50"),
+):
+    """Find contacts who qualified ≥N days ago but never uploaded, tag them
+    `qualified-no-upload`, and send the fallback SMS.
+
+    Run this on a schedule (daily cron, or manual via curl).
+    """
+    if not _check_admin(token):
+        return {"ok": False, "error": "unauthorized"}
+
+    try:
+        days = int(days_since_qualified)
+    except Exception:
+        days = 4
+    try:
+        max_n = int(limit)
+    except Exception:
+        max_n = 50
+
+    from ghl import GHLClient
+    try:
+        client = GHLClient()
+    except Exception as e:
+        return {"ok": False, "error": f"ghl_init_failed: {e}"}
+
+    # Pull all 'qualified' contacts
+    try:
+        contacts = client.search_contacts_by_tag("qualified") if hasattr(client, "search_contacts_by_tag") else []
+    except Exception as e:
+        return {"ok": False, "error": f"search_failed: {e}"}
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    flipped = 0
+    sms_sent = 0
+    skipped = 0
+    audit = []
+
+    for c in contacts[:max_n]:
+        cid = c.get("id") or c.get("_id")
+        if not cid:
+            continue
+        tags = [str(t).lower() for t in (c.get("tags") or [])]
+        # Skip if they already uploaded, or already pivoted, or already opted out
+        if "bureau-scan-completed" in tags or "qualified-no-upload" in tags or "unsubscribed" in tags:
+            skipped += 1
+            continue
+
+        # Check qualified_at custom field — only flip if ≥ N days have passed
+        qualified_at = None
+        for cf in (c.get("customFields") or []):
+            if (cf.get("name") or cf.get("fieldKey") or "").lower().endswith("qualified_at"):
+                qualified_at = cf.get("value") or cf.get("field_value") or ""
+                break
+        if qualified_at:
+            try:
+                q_dt = datetime.fromisoformat(qualified_at.replace("Z", "+00:00"))
+                if q_dt.tzinfo is None:
+                    q_dt = q_dt.replace(tzinfo=timezone.utc)
+                if q_dt > cutoff:
+                    skipped += 1
+                    continue
+            except Exception:
+                pass  # if we can't parse the timestamp, fall through and flip them
+
+        try:
+            client.add_tags(cid, ["qualified-no-upload"])
+            flipped += 1
+            fn = c.get("firstName") or c.get("first_name") or "there"
+            phone = c.get("phone") or ""
+            if phone:
+                try:
+                    body = _NON_UPLOADER_SMS.format(fn=fn)
+                    if hasattr(client, "send_sms"):
+                        ok = client.send_sms(contact_id=cid, message=body)
+                        if ok:
+                            sms_sent += 1
+                except Exception as se:
+                    audit.append({"cid": cid, "sms_error": str(se)[:200]})
+        except Exception as e:
+            audit.append({"cid": cid, "tag_error": str(e)[:200]})
+
+    return {
+        "ok": True,
+        "qualified_total": len(contacts),
+        "checked": min(len(contacts), max_n),
+        "flipped_to_no_upload": flipped,
+        "fallback_sms_sent": sms_sent,
+        "skipped": skipped,
+        "audit_first_20": audit[:20],
+    }
+
+
+@app.post("/admin/fire-qualifier")
+def admin_fire_qualifier(
+    token: str = Form(""),
+    contact_id: str = Form(""),
+    first_name: str = Form(""),
+    email: str = Form(""),
+    phone: str = Form(""),
+):
+    """Fire SMS #1 + Email #1 to a SINGLE contact. Use for testing or recovery
+    when you want to manually kick off the qualifier on one specific lead.
+
+    Pass contact_id (required for SMS+Email routing in GHL), plus the contact's
+    first_name / email / phone (so we don't have to round-trip to GHL to fetch).
+    """
+    if not _check_admin(token):
+        return {"ok": False, "error": "unauthorized"}
+    if not contact_id:
+        return {"ok": False, "error": "missing contact_id"}
+
+    from ghl import GHLClient
+    try:
+        client = GHLClient()
+    except Exception as e:
+        return {"ok": False, "error": f"ghl_init_failed: {e}"}
+
+    fn = first_name or "there"
+    result = _send_qualifier_first_touch(client, contact_id, fn, email, phone)
+    return {"ok": True, **result, "contact_id": contact_id, "first_name": fn}
 
 
 @app.get("/healthz")

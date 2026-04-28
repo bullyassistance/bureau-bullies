@@ -638,6 +638,96 @@ class GHLClient:
                     pass
         return results[:limit]
 
+    def search_contact_by_email(self, email: str) -> dict | None:
+        """Look up a single contact by email address. Returns the contact dict or None.
+
+        Critical for the IG/SMS already-scanned reconciliation flow: user DMs us
+        from an IG handle that doesn't match any GHL contact, claims to have
+        uploaded, gives us their email — we look it up and pull their scan data.
+        """
+        if not email or "@" not in email:
+            return None
+        email = email.strip().lower()
+        try:
+            if self.version == "v1":
+                url = f"{V1_BASE}/contacts/lookup"
+                r = requests.get(
+                    url,
+                    headers=self._headers,
+                    params={"email": email},
+                    timeout=20,
+                )
+                if r.ok:
+                    contacts = r.json().get("contacts", []) or []
+                    return contacts[0] if contacts else None
+            else:
+                # v2: /contacts/search by email
+                url = f"{V2_BASE}/contacts/search"
+                r = requests.post(
+                    url,
+                    headers=self._headers,
+                    json={
+                        "locationId": self.location_id,
+                        "pageLimit": 1,
+                        "filters": [{"field": "email", "operator": "eq", "value": email}],
+                    },
+                    timeout=20,
+                )
+                if r.ok:
+                    contacts = r.json().get("contacts", []) or []
+                    return contacts[0] if contacts else None
+                # Fallback: GET /contacts/?email=
+                r = requests.get(
+                    f"{V2_BASE}/contacts/",
+                    headers=self._headers,
+                    params={"locationId": self.location_id, "query": email, "limit": 5},
+                    timeout=20,
+                )
+                if r.ok:
+                    contacts = r.json().get("contacts", []) or []
+                    # Filter to exact email match (query is fuzzy)
+                    for c in contacts:
+                        if (c.get("email") or "").lower() == email:
+                            return c
+                    return contacts[0] if contacts else None
+        except Exception as e:
+            logger.warning("search_contact_by_email failed for %s: %s", email, e)
+        return None
+
+    def get_scan_context_by_email(self, email: str) -> dict:
+        """Look up a contact by email and return a flat dict of cr_* scan fields
+        ready to be merged into Bully AI's contact_context.
+
+        Returns {} if no contact found or no scan fields present.
+        """
+        c = self.search_contact_by_email(email)
+        if not c:
+            return {}
+        out = {}
+        # Top-level fields
+        if c.get("firstName"):
+            out["first_name"] = c["firstName"]
+        if c.get("id") or c.get("_id"):
+            out["matched_contact_id"] = c.get("id") or c.get("_id")
+        # Custom fields — GHL returns them in different shapes per version
+        cfs = c.get("customFields") or c.get("customField") or []
+        if isinstance(cfs, list):
+            for cf in cfs:
+                key = (cf.get("fieldKey") or cf.get("name") or cf.get("key") or "").replace("contact.", "")
+                val = cf.get("value") or cf.get("field_value") or cf.get("fieldValue") or ""
+                if key and val and (key.startswith("cr_") or key in ("goal", "biggest_debt", "timeline")):
+                    out[key] = val
+        elif isinstance(cfs, dict):
+            for k, v in cfs.items():
+                k_clean = str(k).replace("contact.", "")
+                if v and (k_clean.startswith("cr_") or k_clean in ("goal", "biggest_debt", "timeline")):
+                    out[k_clean] = v
+        # Tags
+        tags = c.get("tags") or []
+        if tags:
+            out["_tags"] = list(tags)
+        return out
+
     # ---- Tag helper ------------------------------------------------------
     def add_tags(self, contact_id: str, tags: list) -> None:
         if self.version == "v1":

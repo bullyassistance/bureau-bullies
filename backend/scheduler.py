@@ -318,6 +318,18 @@ def _auto_rebuild_queue_from_ghl() -> int:
         logger.warning("Scheduler boot: search_contacts_by_tag failed: %s", e)
         return 0
 
+    # GHL v2 returns customFields as [{id, value}] without the field key,
+    # so build an id→key reverse map first.
+    id_to_key = {}
+    try:
+        for f in client.list_custom_fields():
+            fid = f.get("id") or f.get("_id")
+            fkey = (f.get("fieldKey") or f.get("name") or "").replace("contact.", "")
+            if fid and fkey:
+                id_to_key[fid] = fkey
+    except Exception as e:
+        logger.warning("Scheduler boot: could not load custom field map: %s", e)
+
     enqueued = 0
     skipped = 0
     for c in (contacts or []):
@@ -330,9 +342,13 @@ def _auto_rebuild_queue_from_ghl() -> int:
         cf = c.get("customFields") or c.get("custom_field") or []
         cf_map = {}
         for item in cf:
-            k = item.get("fieldKey") or item.get("key") or item.get("name") or ""
-            v = item.get("value", "")
-            cf_map[k.replace("contact.", "")] = v
+            fid = item.get("id") or item.get("_id") or item.get("customFieldId") or ""
+            k = (item.get("fieldKey") or item.get("key") or item.get("name") or "").replace("contact.", "")
+            if not k and fid in id_to_key:
+                k = id_to_key[fid]
+            v = item.get("value") or item.get("field_value") or item.get("fieldValue") or ""
+            if k:
+                cf_map[k] = v
         emails = []
         for i in range(1, 8):
             subj = cf_map.get(f"cr_email_{i}_subject", "")

@@ -1069,8 +1069,22 @@ def admin_backfill_email_drip(token: str = Form("")):
     except Exception as e:
         return {"ok": False, "error": f"search_failed: {e}"}
 
+    # GHL v2 returns customFields as [{id, value}] without the field key,
+    # so build an id→key reverse map FIRST from the global custom-field list.
+    id_to_key = {}
+    try:
+        for f in client.list_custom_fields():
+            fid = f.get("id") or f.get("_id")
+            fkey = (f.get("fieldKey") or f.get("name") or "").replace("contact.", "")
+            if fid and fkey:
+                id_to_key[fid] = fkey
+    except Exception as e:
+        logger.warning("backfill-email-drip: could not load field map: %s", e)
+
     enqueued = 0
     skipped = 0
+    no_emails = 0
+    sample_keys_seen = set()
     for c in contacts or []:
         cid = c.get("id") or c.get("_id")
         email_addr = c.get("email") or c.get("emailAddress")
@@ -1078,14 +1092,20 @@ def admin_backfill_email_drip(token: str = Form("")):
             skipped += 1
             continue
         fn = c.get("firstName") or c.get("first_name") or ""
-        # Reconstruct the 7 emails from stored custom fields
         cf = c.get("customFields") or c.get("custom_field") or []
-        # Map fieldKey -> value
+        # Build cf_map by resolving each customField's id through id_to_key
         cf_map = {}
         for item in cf:
-            k = item.get("fieldKey") or item.get("key") or item.get("name") or ""
-            v = item.get("value", "")
-            cf_map[k.replace("contact.", "")] = v
+            # GHL v2 shape: {id, value}. v1 / legacy: {fieldKey, value} or {key, value}.
+            fid = item.get("id") or item.get("_id") or item.get("customFieldId") or ""
+            key = (item.get("fieldKey") or item.get("key") or item.get("name") or "").replace("contact.", "")
+            if not key and fid in id_to_key:
+                key = id_to_key[fid]
+            val = item.get("value") or item.get("field_value") or item.get("fieldValue") or ""
+            if key:
+                cf_map[key] = val
+                if len(sample_keys_seen) < 12:
+                    sample_keys_seen.add(key)
         emails = []
         for i in range(1, 8):
             subj = cf_map.get(f"cr_email_{i}_subject", "")
@@ -1093,17 +1113,36 @@ def admin_backfill_email_drip(token: str = Form("")):
             if subj and body:
                 emails.append({"day": [0, 1, 3, 5, 7, 10, 14][i - 1], "subject": subj, "body": body})
         if not emails:
+            no_emails += 1
             skipped += 1
             continue
-        # Cancel any pending rows for this contact first so we don't duplicate
         try:
             cancel_drip(cid, reason="backfill-replace")
         except Exception:
             pass
-        n = schedule_email_drip(cid, email_addr, fn, emails)
+        # Use scan_completed_at if present so the cadence lands on real dates
+        scan_at = cf_map.get("scan_completed_at") or cf_map.get("cr_scan_completed_at") \
+                or c.get("dateAdded") or c.get("createdAt") or ""
+        scan_dt = None
+        if scan_at:
+            try:
+                scan_dt = datetime.fromisoformat(str(scan_at).replace("Z", "+00:00"))
+                if scan_dt.tzinfo is None:
+                    scan_dt = scan_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                scan_dt = None
+        n = schedule_email_drip(cid, email_addr, fn, emails, scan_time=scan_dt)
         if n:
             enqueued += 1
-    return {"ok": True, "contacts_enqueued": enqueued, "skipped": skipped}
+    return {
+        "ok": True,
+        "contacts_total": len(contacts or []),
+        "contacts_enqueued": enqueued,
+        "skipped": skipped,
+        "skipped_no_email_fields": no_emails,
+        "field_map_loaded": len(id_to_key),
+        "sample_keys_seen_on_contacts": sorted(list(sample_keys_seen))[:12],
+    }
 
 
 # Bootstrap fallback token, only used if ADMIN_TOKEN env var is not set.

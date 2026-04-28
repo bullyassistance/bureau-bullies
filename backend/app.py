@@ -1335,6 +1335,145 @@ def admin_dispatch_next(token: str = Form(""), regenerate: str = Form("1"), limi
     }
 
 
+@app.get("/admin/contact-schedule")
+def admin_contact_schedule(token: str = "", email: str = "", contact_id: str = ""):
+    """Return the full schedule for a single contact: sent + pending emails with
+    timestamps. Use to answer "when does <contact> get the next email?"
+
+    Query: ?token=...&email=info@clarktextile.com  (or &contact_id=abc123)
+    """
+    if not _check_admin(token):
+        return {"ok": False, "error": "unauthorized"}
+    if not email and not contact_id:
+        return {"ok": False, "error": "pass email= or contact_id="}
+
+    from scheduler import _load_db
+    rows = _load_db()
+    email_lc = (email or "").strip().lower()
+    matches = []
+    for r in rows:
+        if contact_id and r.get("contact_id") != contact_id:
+            continue
+        if email_lc and (r.get("contact_email") or "").lower() != email_lc:
+            continue
+        matches.append(r)
+
+    if not matches:
+        return {
+            "ok": True,
+            "found": 0,
+            "hint": "No rows matched. Either the contact isn't in the scheduler queue, the auto-rebuild hasn't run yet, or the email/contact_id doesn't match what's in GHL.",
+        }
+
+    # Sort by send_at to make the timeline readable
+    matches.sort(key=lambda r: r.get("send_at") or "")
+    now = datetime.now(timezone.utc)
+    summary = []
+    next_pending = None
+    for r in matches:
+        sa_iso = r.get("send_at") or ""
+        try:
+            sa_dt = datetime.fromisoformat(sa_iso.replace("Z", "+00:00"))
+            if sa_dt.tzinfo is None:
+                sa_dt = sa_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            sa_dt = None
+        delta = ""
+        if sa_dt:
+            diff = sa_dt - now
+            secs = int(diff.total_seconds())
+            if secs > 0:
+                if secs < 3600:
+                    delta = f"in {secs // 60} min"
+                elif secs < 86400:
+                    delta = f"in {secs // 3600}h"
+                else:
+                    delta = f"in {secs // 86400}d {(secs % 86400) // 3600}h"
+            else:
+                delta = f"{abs(secs) // 3600}h ago" if abs(secs) < 86400 else f"{abs(secs) // 86400}d ago"
+        summary.append({
+            "email_index": r.get("email_index"),
+            "day": r.get("day"),
+            "subject": (r.get("subject") or "")[:90],
+            "send_at": sa_iso,
+            "send_relative": delta,
+            "status": r.get("status"),
+            "dispatched_at": r.get("dispatched_at", ""),
+            "retry_count": r.get("retry_count", 0),
+        })
+        if r.get("status") == "pending" and next_pending is None and sa_dt and sa_dt > now:
+            next_pending = {
+                "email_index": r.get("email_index"),
+                "subject": r.get("subject", ""),
+                "send_at": sa_iso,
+                "send_relative": delta,
+            }
+
+    return {
+        "ok": True,
+        "contact_id": matches[0].get("contact_id"),
+        "contact_email": matches[0].get("contact_email"),
+        "first_name": matches[0].get("first_name"),
+        "found": len(matches),
+        "next_email": next_pending,
+        "schedule": summary,
+    }
+
+
+@app.get("/admin/sent-today")
+def admin_sent_today(token: str = "", days: str = "1"):
+    """Who got emailed in the last N days. Default N=1 (today/yesterday).
+    Returns one entry per contact with their email + which email indexes fired."""
+    if not _check_admin(token):
+        return {"ok": False, "error": "unauthorized"}
+    try:
+        n = int(days)
+    except Exception:
+        n = 1
+    if n < 1: n = 1
+
+    from scheduler import _load_db
+    rows = _load_db()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=n)
+    by_contact = {}
+    for r in rows:
+        if r.get("status") != "sent":
+            continue
+        d_iso = r.get("dispatched_at") or ""
+        if not d_iso:
+            continue
+        try:
+            d_dt = datetime.fromisoformat(d_iso.replace("Z", "+00:00"))
+            if d_dt.tzinfo is None:
+                d_dt = d_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if d_dt < cutoff:
+            continue
+        ce = r.get("contact_email") or ""
+        if ce not in by_contact:
+            by_contact[ce] = {
+                "contact_email": ce,
+                "first_name": r.get("first_name") or "",
+                "contact_id": r.get("contact_id") or "",
+                "fired": [],
+            }
+        by_contact[ce]["fired"].append({
+            "email_index": r.get("email_index"),
+            "subject": (r.get("subject") or "")[:80],
+            "dispatched_at": d_iso,
+        })
+
+    out = sorted(by_contact.values(), key=lambda x: x["contact_email"])
+    return {
+        "ok": True,
+        "since_hours": n * 24,
+        "unique_contacts_emailed": len(out),
+        "total_emails_sent": sum(len(x["fired"]) for x in out),
+        "by_contact": out,
+    }
+
+
 @app.get("/admin/scheduler-status")
 def admin_scheduler_status(token: str = ""):
     """Quick read-only summary of the scheduler queue. Auth via ?token=..."""

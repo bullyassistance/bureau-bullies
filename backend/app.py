@@ -1374,6 +1374,26 @@ def admin_dispatch_next(token: str = Form(""), regenerate: str = Form("1"), limi
     }
 
 
+@app.post("/admin/cancel-all-pending")
+def admin_cancel_all_pending(token: str = Form("")):
+    """KILL SWITCH: marks every pending and failed row as 'admin-cancelled'.
+    No more emails fire until you re-run /admin/backfill-email-drip.
+    Use when you see a spam burst in progress and want to stop it cold."""
+    if not _check_admin(token):
+        return {"ok": False, "error": "unauthorized"}
+    from scheduler import _load_db, _save_db, _now_iso
+    rows = _load_db()
+    n = 0
+    for r in rows:
+        if r.get("status") in ("pending", "failed"):
+            r["status"] = "admin-cancelled"
+            r["cancelled_at"] = _now_iso()
+            n += 1
+    if n:
+        _save_db(rows)
+    return {"ok": True, "rows_cancelled": n, "hint": "Re-enable by running /admin/backfill-email-drip"}
+
+
 @app.get("/admin/contact-schedule")
 def admin_contact_schedule(token: str = "", email: str = "", contact_id: str = ""):
     """Return the full schedule for a single contact: sent + pending emails with

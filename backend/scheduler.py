@@ -453,14 +453,22 @@ def _auto_rebuild_queue_from_ghl() -> int:
 
 
 async def _poll_loop():
-    """Background async loop that dispatches due emails every POLL_SECONDS."""
+    """Background async loop that dispatches due emails every POLL_SECONDS.
+
+    Auto-rebuild is OFF by default now. Set BB_AUTO_REBUILD=1 in env to re-enable.
+    Reason: auto-rebuild was undoing manual cancel-all-pending operations because
+    every Render redeploy wiped /tmp, the boot saw pending=0, and it re-queued
+    every contact's full sequence from GHL — including ones we'd just killed.
+    Manual control via /admin/backfill-email-drip is the safer default.
+    """
     logger.info("Email scheduler poll loop started (every %ds)", POLL_SECONDS)
-    # On first tick, if the queue is empty, rebuild from GHL — this self-heals
-    # the queue after any redeploy that wipes /tmp.
-    try:
-        await asyncio.to_thread(_auto_rebuild_queue_from_ghl)
-    except Exception as e:
-        logger.warning("Scheduler boot: auto-rebuild raised %s — continuing", e)
+    if os.getenv("BB_AUTO_REBUILD", "0") == "1":
+        try:
+            await asyncio.to_thread(_auto_rebuild_queue_from_ghl)
+        except Exception as e:
+            logger.warning("Scheduler boot: auto-rebuild raised %s — continuing", e)
+    else:
+        logger.info("Scheduler boot: auto-rebuild DISABLED (default). Trigger manually via /admin/backfill-email-drip")
     while True:
         try:
             n = await asyncio.to_thread(_dispatch_due)

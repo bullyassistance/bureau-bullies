@@ -92,6 +92,14 @@ def _save_db(rows: List[dict]) -> None:
         tmp.replace(DB_PATH)
 
 
+# If we rebuild the queue (after a redeploy) and an email's send_at is more
+# than this many days in the past, mark it "skipped-too-old" instead of
+# "pending" so the dispatcher doesn't spam the contact with stale emails.
+# A new scan (e.g. 4 days ago) will still fire emails 1, 2, 3 as catch-up.
+# A 200-day-old scan will fire NOTHING — that drip is over.
+MAX_PAST_DUE_DAYS = int(os.getenv("BB_MAX_PAST_DUE_DAYS", "7"))
+
+
 def schedule_email_drip(
     contact_id: str,
     contact_email: str,
@@ -104,7 +112,12 @@ def schedule_email_drip(
 
     emails: list of {"day": int, "subject": str, "body": str} (output from
             email_generator.generate_full_sequence)
-    Returns: number of emails enqueued.
+    Returns: number of emails enqueued (NOT counting skipped-too-old rows).
+
+    Anti-spam guardrail: any email whose computed send_at is more than
+    MAX_PAST_DUE_DAYS in the past gets recorded as 'skipped-too-old' instead
+    of 'pending'. This prevents the dispatcher from firing 7 emails in a row
+    to a contact whose scan was 200+ days ago when the queue gets rebuilt.
     """
     if not contact_id or not contact_email:
         logger.warning("Cannot schedule drip — missing contact_id or email")
@@ -114,11 +127,21 @@ def schedule_email_drip(
         scan_time = datetime.now(timezone.utc)
 
     rows = _load_db()
+    now = datetime.now(timezone.utc)
+    too_old_cutoff = now - timedelta(days=MAX_PAST_DUE_DAYS)
     count = 0
+    skipped_old = 0
     for i, email in enumerate(emails or []):
         if i >= len(CADENCE_SECONDS):
             break
         send_at = scan_time + timedelta(seconds=CADENCE_SECONDS[i])
+        # Anti-spam: don't queue old emails that would fire as 'past due'
+        if send_at < too_old_cutoff:
+            status = "skipped-too-old"
+            skipped_old += 1
+        else:
+            status = "pending"
+            count += 1
         rows.append({
             "id": f"{contact_id}-{i+1}-{int(scan_time.timestamp())}",
             "contact_id": contact_id,
@@ -129,12 +152,14 @@ def schedule_email_drip(
             "subject": email.get("subject", ""),
             "body": email.get("body", ""),
             "send_at": send_at.isoformat(),
-            "status": "pending",
+            "status": status,
             "created_at": scan_time.isoformat(),
         })
-        count += 1
     _save_db(rows)
-    logger.info("Scheduled %d emails for contact %s (%s)", count, contact_id, contact_email)
+    logger.info(
+        "Scheduled %d emails for %s (%s) — %d skipped as too-old",
+        count, contact_id, contact_email, skipped_old,
+    )
     return count
 
 
@@ -157,9 +182,13 @@ MAX_RETRIES = 5
 
 
 def _due_now(rows: List[dict]) -> List[dict]:
-    """Return pending rows AND failed rows (for retry, up to MAX_RETRIES) that are due."""
+    """Return pending rows AND failed rows (for retry, up to MAX_RETRIES) that
+    are due — but NOT rows whose send_at is more than MAX_PAST_DUE_DAYS in the
+    past (those would be spammy catch-up sends from a stale rebuild)."""
     now = datetime.now(timezone.utc)
+    too_old_cutoff = now - timedelta(days=MAX_PAST_DUE_DAYS)
     out = []
+    skipped_old = 0
     for r in rows:
         status = r.get("status")
         if status not in ("pending", "failed"):
@@ -170,10 +199,20 @@ def _due_now(rows: List[dict]) -> List[dict]:
             sa = datetime.fromisoformat(r["send_at"])
             if sa.tzinfo is None:
                 sa = sa.replace(tzinfo=timezone.utc)
+            if sa < too_old_cutoff:
+                # Anti-spam: mark as too-old in place so we don't keep checking it
+                r["status"] = "skipped-too-old"
+                r["skipped_at"] = _now_iso()
+                skipped_old += 1
+                continue
             if sa <= now:
                 out.append(r)
         except Exception:
             continue
+    if skipped_old:
+        # Persist the status change so we don't reconsider these rows
+        _save_db(rows)
+        logger.info("_due_now: marked %d stale rows as skipped-too-old", skipped_old)
     return out
 
 

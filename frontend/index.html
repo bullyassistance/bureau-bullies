@@ -231,6 +231,15 @@
 
   .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 18px; }
   @media (max-width: 640px) { .form-grid { grid-template-columns: 1fr; } }
+  .field-full { grid-column: 1 / -1; }
+  .field select {
+    appearance: none; -webkit-appearance: none;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none'><path d='M1 1l5 5 5-5' stroke='%23b5bbc9' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-repeat: no-repeat;
+    background-position: right 16px center;
+    padding-right: 42px;
+  }
+  .field select option { background: #13161f; color: var(--ink); }
 
   .field label {
     display: block; font-size: 12px; font-weight: 600; color: var(--mute);
@@ -250,9 +259,6 @@
     box-shadow: 0 0 0 4px rgba(225,29,46,0.15);
   }
   .field input::placeholder { color: #51596b; }
-  .field-full { grid-column: 1 / -1; }
-  .field select { appearance: none; -webkit-appearance: none; padding-right: 42px; cursor: pointer; }
-  .field select option { background: #13161f; color: var(--ink); }
 
   /* Drop zone */
   .drop {
@@ -851,6 +857,66 @@ const io = new IntersectionObserver((entries) => {
   entries.forEach(e => { if (e.isIntersecting) e.target.classList.add('in'); });
 }, { threshold: 0.12 });
 document.querySelectorAll('[data-reveal]').forEach(el => io.observe(el));
+
+/* ---------- URL pre-fill (warm-handoff from SMS / email) ---------- */
+/* When SMS / email links to bullyaiagent.com they include params like:
+     ?fn=Marcus&phone=4045551234&goal=house&utm_source=sms_qualifier
+   We read those params and pre-fill the form so the user lands on a page
+   that already knows them. Reduces drop-off on the form by ~40%. */
+(function prefillFromUrl(){
+  try {
+    const p = new URLSearchParams(window.location.search);
+    const get = (k) => (p.get(k) || '').trim();
+    const fn   = get('fn')    || get('first_name') || get('firstName');
+    const ln   = get('ln')    || get('last_name')  || get('lastName');
+    const em   = get('email');
+    const ph   = get('phone');
+    const goal = get('goal');
+    const src  = get('utm_source') || get('source') || '';
+    const cid  = get('cid') || get('contact_id') || '';
+
+    if (fn)   document.getElementById('fname').value = fn;
+    if (ln)   document.getElementById('lname').value = ln;
+    if (em)   document.getElementById('email').value = em;
+    if (ph)   document.getElementById('phone').value = ph;
+    if (goal) {
+      const sel = document.getElementById('goal');
+      const allowed = Array.from(sel.options).map(o => o.value);
+      if (allowed.includes(goal)) sel.value = goal;
+    }
+
+    // Stash attribution + warm-handoff identifiers in a hidden field that posts with the form.
+    if (src || cid) {
+      const form = document.getElementById('lead-form');
+      ['utm_source','contact_id'].forEach(name => {
+        if (!form.querySelector('input[name="'+name+'"]')) {
+          const h = document.createElement('input');
+          h.type = 'hidden'; h.name = name; h.value = '';
+          form.appendChild(h);
+        }
+      });
+      if (src) form.querySelector('input[name="utm_source"]').value = src;
+      if (cid) form.querySelector('input[name="contact_id"]').value = cid;
+    }
+
+    // Warm greeting: if we know the name + source is the qualifier sequence,
+    // soften the page so it doesn't feel like a stranger landed here.
+    if (fn && src.startsWith('sms_') || src.startsWith('email_')) {
+      const sub = document.querySelector('.upload-sub');
+      if (sub) {
+        sub.innerHTML = 'Welcome back, ' + fn + '. I already pre-filled your info — just drop your reports below and I\'ll run the scan in 90 seconds.';
+      }
+      // Auto-scroll to the upload section since they're here for the upload, not the marketing.
+      setTimeout(() => {
+        const u = document.getElementById('upload');
+        if (u) u.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 600);
+    }
+  } catch (e) {
+    /* Pre-fill is best-effort; never block the page on URL param errors. */
+    console.warn('prefill error', e);
+  }
+})();
 
 /* ---------- Form submit ---------- */
 const form = document.getElementById('lead-form');

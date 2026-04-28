@@ -237,6 +237,12 @@ def _dispatch_due() -> int:
     """
     Called by the polling loop. Sends any due emails and marks them sent.
     Returns number dispatched this tick.
+
+    Anti-spam: fires AT MOST 1 email per contact per tick. If a contact has
+    multiple past-due pending rows (e.g. after a queue rebuild), only the
+    earliest-due one fires this tick, the rest wait for the next tick (60s
+    later). This spreads catch-up over time instead of bursting 7 emails at
+    once like Umar got hit with.
     """
     from ghl import GHLClient  # local import to avoid circular
 
@@ -244,6 +250,30 @@ def _dispatch_due() -> int:
     due = _due_now(rows)
     if not due:
         return 0
+
+    # Rate-limit: at most ONE email per contact this tick.
+    # Sort due-rows by send_at so the earliest scheduled email goes first.
+    def _sa_key(r):
+        try:
+            return r.get("send_at") or ""
+        except Exception:
+            return ""
+    due.sort(key=_sa_key)
+    seen_contacts = set()
+    rate_limited = []
+    for r in due:
+        cid = r.get("contact_id") or ""
+        if cid in seen_contacts:
+            # This contact already has one email firing this tick — defer
+            continue
+        seen_contacts.add(cid)
+        rate_limited.append(r)
+    if len(rate_limited) < len(due):
+        logger.info(
+            "Rate-limit: %d due rows trimmed to %d (1 per contact this tick)",
+            len(due), len(rate_limited),
+        )
+    due = rate_limited
 
     try:
         client = GHLClient()

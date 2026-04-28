@@ -638,11 +638,16 @@ class GHLClient:
             return []
 
     # ---- Contact search by tag ------------------------------------------
-    def search_contacts_by_tag(self, tag: str, limit: int = 500) -> list:
-        """Return list of contacts that carry the given tag. Paginates up to `limit`."""
+    def search_contacts_by_tag(self, tag: str, limit: int = 5000) -> list:
+        """Return list of contacts that carry the given tag.
+        PAGINATES through ALL pages so we don't silently truncate at 100.
+
+        v2 uses POST /contacts/search with searchAfter cursor (the value
+        from the last contact's `searchAfter` field is fed back in to get
+        the next page).
+        """
         results = []
         if self.version == "v1":
-            # v1 has /contacts with ?query=tag:xxx or we paginate through /contacts/
             page = 0
             while len(results) < limit:
                 url = f"{V1_BASE}/contacts/"
@@ -662,25 +667,42 @@ class GHLClient:
                     break
                 page += 1
         else:
-            # v2 search endpoint
+            # v2 search endpoint with cursor pagination
             url = f"{V2_BASE}/contacts/search"
-            try:
-                r = requests.post(
-                    url,
-                    headers=self._headers,
-                    json={
-                        "locationId": self.location_id,
-                        "pageLimit": 100,
-                        "filters": [{"field": "tags", "operator": "contains", "value": tag}],
-                    },
-                    timeout=25,
-                )
-                if r.ok:
-                    results = r.json().get("contacts", []) or []
-            except Exception as e:
-                logger.warning("search_contacts_by_tag v2 failed: %s", e)
+            search_after = None
+            page_count = 0
+            max_pages = 60  # 6000 contacts safety cap
+            while page_count < max_pages and len(results) < limit:
+                payload = {
+                    "locationId": self.location_id,
+                    "pageLimit": 100,
+                    "filters": [{"field": "tags", "operator": "contains", "value": tag}],
+                }
+                if search_after:
+                    payload["searchAfter"] = search_after
+                try:
+                    r = requests.post(url, headers=self._headers, json=payload, timeout=25)
+                except Exception as e:
+                    logger.warning("search_contacts_by_tag v2 page %d failed: %s", page_count, e)
+                    break
+                if not r.ok:
+                    if page_count == 0:
+                        logger.warning("search_contacts_by_tag v2 first page failed: %s %s", r.status_code, r.text[:200])
+                    break
+                data = r.json() or {}
+                batch = data.get("contacts", []) or []
+                if not batch:
+                    break
+                results.extend(batch)
+                # Get the searchAfter cursor from the LAST contact for next page
+                last = batch[-1]
+                search_after = last.get("searchAfter") or last.get("search_after") or None
+                page_count += 1
+                # If the page was smaller than pageLimit, we're done
+                if len(batch) < 100 or not search_after:
+                    break
+            # Fallback if v2 search returned nothing on first page
             if not results:
-                # Fallback: /contacts/ list with tag filter
                 try:
                     r = requests.get(
                         f"{V2_BASE}/contacts/",
@@ -692,6 +714,8 @@ class GHLClient:
                         results = r.json().get("contacts", []) or []
                 except Exception:
                     pass
+            logger.info("search_contacts_by_tag(%r): fetched %d contacts across %d pages",
+                        tag, len(results), page_count)
         return results[:limit]
 
     def search_contact_by_email(self, email: str) -> dict | None:

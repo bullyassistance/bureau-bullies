@@ -287,9 +287,95 @@ def _plaintext_to_html(body: str) -> str:
     )
 
 
+def _auto_rebuild_queue_from_ghl() -> int:
+    """If the local scheduler queue is empty (e.g. redeploy wiped /tmp), rebuild
+    it from GHL contacts who already have the cr_email_N_subject/body fields
+    populated from past scans.
+
+    This is the bullet-proof persistence layer: even if /tmp gets nuked on
+    every redeploy, the per-contact email schedule is durable on the GHL
+    contact itself, and we self-heal on every app start.
+
+    Returns the number of contacts re-enqueued.
+    """
+    rows = _load_db()
+    pending = sum(1 for r in rows if r.get("status") == "pending")
+    if pending > 0:
+        logger.info("Scheduler boot: %d pending rows already present, no rebuild needed", pending)
+        return 0
+
+    logger.info("Scheduler boot: queue empty, rebuilding from GHL contact custom fields...")
+    try:
+        from ghl import GHLClient
+        client = GHLClient()
+    except Exception as e:
+        logger.warning("Scheduler boot: GHL client init failed, can't auto-rebuild: %s", e)
+        return 0
+
+    try:
+        contacts = client.search_contacts_by_tag("bureau-scan") if hasattr(client, "search_contacts_by_tag") else []
+    except Exception as e:
+        logger.warning("Scheduler boot: search_contacts_by_tag failed: %s", e)
+        return 0
+
+    enqueued = 0
+    skipped = 0
+    for c in (contacts or []):
+        cid = c.get("id") or c.get("_id")
+        email_addr = c.get("email") or c.get("emailAddress")
+        if not cid or not email_addr:
+            skipped += 1
+            continue
+        fn = c.get("firstName") or c.get("first_name") or ""
+        cf = c.get("customFields") or c.get("custom_field") or []
+        cf_map = {}
+        for item in cf:
+            k = item.get("fieldKey") or item.get("key") or item.get("name") or ""
+            v = item.get("value", "")
+            cf_map[k.replace("contact.", "")] = v
+        emails = []
+        for i in range(1, 8):
+            subj = cf_map.get(f"cr_email_{i}_subject", "")
+            body = cf_map.get(f"cr_email_{i}_body", "")
+            if subj and body:
+                emails.append({"day": [0, 1, 3, 5, 7, 10, 14][i - 1], "subject": subj, "body": body})
+        if not emails:
+            skipped += 1
+            continue
+
+        # Use the contact's scan_completed_at if available, otherwise approximate
+        # from createdAt so the cadence offsets land on the correct dates.
+        scan_at_iso = cf_map.get("scan_completed_at") or cf_map.get("cr_scan_completed_at") or c.get("dateAdded") or c.get("createdAt") or ""
+        scan_dt = None
+        if scan_at_iso:
+            try:
+                scan_dt = datetime.fromisoformat(str(scan_at_iso).replace("Z", "+00:00"))
+                if scan_dt.tzinfo is None:
+                    scan_dt = scan_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                scan_dt = None
+
+        try:
+            n = schedule_email_drip(cid, email_addr, fn, emails, scan_time=scan_dt)
+            if n:
+                enqueued += 1
+        except Exception as e:
+            logger.warning("Auto-rebuild: schedule_email_drip failed for %s: %s", cid, e)
+
+    logger.info("Scheduler boot: auto-rebuild done — enqueued=%d skipped=%d total_contacts=%d",
+                enqueued, skipped, len(contacts or []))
+    return enqueued
+
+
 async def _poll_loop():
     """Background async loop that dispatches due emails every POLL_SECONDS."""
     logger.info("Email scheduler poll loop started (every %ds)", POLL_SECONDS)
+    # On first tick, if the queue is empty, rebuild from GHL — this self-heals
+    # the queue after any redeploy that wipes /tmp.
+    try:
+        await asyncio.to_thread(_auto_rebuild_queue_from_ghl)
+    except Exception as e:
+        logger.warning("Scheduler boot: auto-rebuild raised %s — continuing", e)
     while True:
         try:
             n = await asyncio.to_thread(_dispatch_due)

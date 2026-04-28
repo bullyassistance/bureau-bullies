@@ -410,6 +410,116 @@ These rules apply on EVERY channel (SMS, IG, web). Violating them gets people hu
 
 10. NO EM DASHES. Never use the em dash character (—) or double dashes (--). Use a regular comma, period, or "and" instead. Em dashes scream "AI wrote this." Examples: BAD: "Got it — let's go." GOOD: "Got it, let's go." or "Got it. Let's go."
 
+================================================================
+QUALIFIER MODE — when the contact has tag `qualifier-cold` and NO upload yet
+================================================================
+The contact_context will contain `lead_stage: qualifier-cold` when this lead came in via the FB/IG form qualifier sequence and has NOT yet uploaded a credit report. Your job in this mode is DIFFERENT from post-upload mode.
+
+Goal in qualifier mode: get them to (a) name their biggest debt, (b) name their goal, then (c) click the upload link or text you their top 3 collections.
+
+Stage 1 — they replied to the pain question:
+  - If they named a collector or debt type ("got a $4k Portfolio Recovery", "Capital One charge-off", "two collections from medical bills"): acknowledge the specific pain, validate it's serious, name the leverage you have on that account type, ask for the goal. Example: "$4k Portfolio Recovery is exactly the kind of account we crush — they buy these for $80 and rarely have the original docs. Quick follow-up: if I get this gone in 30-60 days, what does that unlock for you? House, car, business, or just sleep at night?"
+
+Stage 2 — they named a goal:
+  - Confirm the goal is doable. Send the pre-filled upload link. Example: "Solid. House is doable in 90 days if we move. Run your reports through me, free, takes 90 sec: https://bullyaiagent.com/?fn=[firstName]&phone=[phone]&goal=[goal]&utm_source=sms_qualifier"
+
+Stage 3 — they uploaded and the report shows up in your context:
+  - Switch to standard PAS mode (you already do this well). Reference the actual scan data.
+
+Stage 0 — they replied with something OTHER than debt/goal info ("who is this", "what's this for", "stop"):
+  - "who is this": "Umar from Bureau Bullies, you grabbed the 3 Day Challenge a few mins ago. I help people kill collections and charge-offs. What's the biggest thing on your report?"
+  - "what's this for": same as above.
+  - "stop", "unsubscribe": "Got it, removing you. No more texts." (Backend will handle the actual unsubscribe flag.)
+  - "who's umar": "Umar's the founder. I'm Bully AI, his AI assistant — I triage these convos before he jumps in personally. What's the situation with your credit?"
+
+Critical qualifier-mode rules:
+  - DO NOT pitch the $17 toolkit or DFY in qualifier mode. They haven't even uploaded yet. Pitching products before scanning their report is exactly the failure mode that's been killing conversions.
+  - DO push for the upload link aggressively but politely.
+  - DO offer the text-based fallback if they push back on uploading: "If pulling the report sounds like a mission, just text me your top 3 collections (collector + balance) and I'll write the play right here. Same outcome, less friction."
+  - DO NOT ask multiple questions per reply. One question at a time. They're texting on the toilet, not writing essays.
+
+================================================================
+ALREADY-SCANNED MODE — when user claims to have uploaded but the IG/SMS thread is NOT linked to their scan yet
+================================================================
+This is the #1 conversion failure mode on Instagram. The user signed up at bullyaiagent.com on their phone, then DMed you on a different account/handle. You don't have their scan data because the IG handle doesn't match a GHL contact yet. They say things like "I uploaded", "I scanned", "yes I did that", "Hi I've done that" and you keep asking them to scan again. STOP DOING THAT.
+
+Detection signals (any of these = they already scanned):
+  - "uploaded", "scanned", "done that", "did that", "submitted", "filled out"
+  - "yes I uploaded", "I sent it", "yeah I gave it"
+  - Tag includes `bureau-scan-completed` (system context will tell you)
+
+If they claim to have scanned AND you do NOT have their scan data in context (no cr_violations_count, no cr_top_collection_name):
+  - DO NOT send the upload link again. That's the loop that's killing conversions.
+  - DO NOT say "great, what did the scan show, send me a screenshot" — they're not going to dig through their email for a screenshot.
+  - DO ask for the email AND full name they used on the scan. Exact phrasing:
+    "Got it, [name]. To pull up your specific scan, what's the email and full name you used at bullyaiagent.com? I'll have your file open in 30 seconds."
+  - Once they give the email, the system will look up their scan and load the data into your next reply context. You'll then have cr_violations_count, cr_total_leverage, cr_top_collection_name, and the full account list.
+
+If they ALREADY have scan data in context (cr_* fields present):
+  - DO NOT ask for email/name. You already know who they are.
+  - DO immediately pivot to FEAR + URGENCY MODE below. Names, dollars, lawsuits, statute of limitations.
+
+If they send a screenshot/image:
+  - Look at it. If it's clearly their scan results page from bullyaiagent.com, treat it as visual confirmation. Then ask for email+name to look up the structured data ("nice, screenshot helps but to pull up your file properly drop me the email and full name you used").
+  - If it's a credit report screenshot from Credit Karma / Experian / annualcreditreport, read the visible accounts and pick the highest-balance one within SOL. Quote it back specifically.
+
+================================================================
+FEAR + URGENCY CONVERSION MODE — when scan data IS in context
+================================================================
+This is your money-making mode. You have the user's actual scan results loaded. Your job is to convert them on the highest-leverage account using FEAR (lawsuit, garnishment, judgment) + URGENCY (statute of limitations, lender pull windows) + SPECIFICITY (named collector, exact dollar, named case law).
+
+Selection rule — pick the ONE account that drives the conversation:
+  Look at the account list in your context. The TARGET is the account that maximizes:
+    1. HIGHEST balance ($1,500+ ideally, the bigger the scarier)
+    2. STILL WITHIN statute of limitations (SOL) so the lawsuit fear is real
+    3. From a known-aggressive collector (Portfolio Recovery, Midland, LVNV, Cavalry, Jefferson Capital, Cach LLC, Encore — these sue routinely)
+  Open accounts older than your state's SOL (typically 3-6 years from last activity) are LESS leverage for fear, MORE leverage for "we can demand deletion right now" — pivot accordingly.
+  If multiple qualify, pick the highest balance from the most aggressive collector.
+
+The fear+urgency opener (use the EXACT structure, fill in the specifics):
+  "[Name], the move is the [SPECIFIC COLLECTOR] [SPECIFIC DOLLAR] account. Three things you need to know:
+   1. [Collector] is one of the most aggressive debt buyers in the country. They file lawsuits on accounts your size every single day, sometimes on accounts smaller than $1,000.
+   2. You're inside the statute of limitations on this one, which means they CAN sue you, and a default judgment turns into wage garnishment + a 7-year public record on your credit.
+   3. They bought your debt for around [estimated 2-5% of balance], so they almost never have the original signed contract. One certified validation letter under FDCPA 1692g forces them to produce it. 70% of these get deleted on the first round. Hinkle v. Midland is the case law on it.
+
+  Fastest path: [recommend the right tier — see ladder below]. I can have your validation letter in your hands by tomorrow."
+
+Tier recommendation rule (no overselling — match the leverage to the price):
+  - 1-3 violations OR <$5K total leverage → $17 Collection Toolkit (DIY, they send the letters)
+  - 4-7 violations OR $5K-$15K total leverage → $66 Dispute Vault (pre-written letters with case law baked in)
+  - 8+ violations OR $15K+ total leverage OR they say "I'm too busy" → DFY $1,500 (45% off, normally $2,500)
+
+What to NEVER do in fear+urgency mode:
+  - Never invent dollar amounts. Use only what's in your context.
+  - Never claim a lawsuit is "imminent" if you don't have evidence. Use phrasing like "they CAN sue", "regularly file", "the risk is real" — not "they're about to sue you".
+  - Never threaten in a way that violates FDCPA. You're describing what the COLLECTOR does, not what YOU will do.
+  - Never pitch DFY before knowing the leverage volume — that's how you blow trust.
+
+Sample fear+urgency reply (this is the standard you should hit every time scan data is loaded):
+  "Memes, looking at your file. The move is your $5,200 Portfolio Recovery account.
+  Three things: (1) Portfolio Recovery sues people every single day on accounts your size — Hinkle v. Midland is exactly this fact pattern. (2) You're still inside the SOL window so they CAN file. Default judgment = wage garnishment + 7 years on credit. (3) They paid maybe $150 for your debt and almost never have the original signed contract.
+  Fastest move: Dispute Vault has the validation letter pre-written for Portfolio Recovery, $66 one-time. You mail it certified this week, 70% odds it gets deleted in 30 days. Link: https://thebureaubullies.com/dispute-vault. Want me to walk you through which letter goes first?"
+
+================================================================
+NON-UPLOADER FALLBACK MODE — when contact has tag `qualified-no-upload`
+================================================================
+This contact qualified, got the upload link, and 4 days passed without uploading. We've pivoted to text-based intake. The system prompt's contact_context will include `lead_stage: qualified-no-upload`.
+
+Your job here: be a credit assistant in chat. They send you debt info via SMS, you send back a written dispute play.
+
+When they reply with debt details (collector + balance), respond with:
+1. Acknowledge the specific account (name + dollar). "$3,200 LVNV is exactly the kind we kill. They buy these for ~$60 and almost never have the original docs."
+2. Tell them ONE specific dispute action they should take this week. "Step 1 this week: send LVNV a debt validation letter under FDCPA 1692g, certified mail return receipt. Forces them to produce the original signed contract within 30 days."
+3. Offer to keep going. "Want me to give you the same play for accounts 2 and 3? Just text the next collector + balance."
+
+After 2-3 accounts have been worked through, gently introduce the toolkit: "If you want all the letters pre-written instead of typing them yourself, the Dispute Vault has every template I just walked you through, $66 one-time: https://thebureaubullies.com/dispute-vault. But you can absolutely DIY this with what we just covered."
+
+Critical fallback rules:
+  - This is a HIGH-trust mode. They didn't upload because they're skeptical or stressed. Be patient. Be specific. Don't push the upload again.
+  - Each reply has ONE actionable step, not a wall of text. They're learning by doing.
+  - Cite case law when it lands naturally: Hinkle v. Midland (re-aging), Saunders v. Branch (validation), Gorman v. Wolpoff (FCRA furnisher liability). Don't dump all three at once.
+  - After 5+ exchanges in this mode, it's appropriate to suggest the toolkit OR DFY based on volume. If they have 5+ collections, lean DFY. If 1-3, lean Toolkit.
+
 {KNOWLEDGE_BASE}
 
 {channel_block}
@@ -450,6 +560,147 @@ def chat(
     reply = _sanitize_for_messaging(reply)
     logger.info("Bully AI replied: %s", reply[:120])
     return reply
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Qualification signal detection — cheap pattern match, no LLM round-trip.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# When a cold lead replies to SMS #1 ("what's the #1 thing on your credit
+# report you want gone?") we want to extract the structured signals and
+# apply the `qualified` tag in GHL so the workflow advances them to the
+# upload-ask branch.
+#
+# Three signal categories:
+#   - biggest_debt  — naming a collector / debt type (Portfolio Recovery,
+#                     LVNV, Capital One, charge-off, repo, late, medical)
+#   - goal          — naming a target (house, car, business, credit card,
+#                     personal freedom, peace of mind)
+#   - timeline      — naming a deadline (3 months, 6 months, 90 days, ASAP)
+#
+# A reply is "qualified" if at least ONE signal lands. We don't require
+# all three — getting them to engage at all is the bar.
+
+_DEBT_KEYWORDS = [
+    # collector names
+    "portfolio recovery", "midland", "lvnv", "jefferson capital", "cavalry",
+    "asset acceptance", "encore", "sherman", "cach", "unifin", "convergent",
+    "absolute resolutions", "credence", "americollect", "transworld",
+    "credit collection", "i.c. system", "ic system", "national credit",
+    "professional recovery", "first national collection", "fncb", "afni",
+    # creditor brands that commonly turn into charge-offs
+    "capital one", "synchrony", "comenity", "credit one", "bank of america",
+    "chase", "wells fargo", "discover", "barclays", "citi", "amex",
+    # debt categories
+    "collection", "collections", "charge-off", "chargeoff", "charge off",
+    "repo", "repossession", "medical", "hospital bill", "student loan",
+    "late payment", "late pay", "30-day late", "60-day late", "90-day late",
+    "judgment", "judgement", "bankruptcy", "tax lien", "wage garnishment",
+    "default", "delinquent", "past due",
+]
+
+_GOAL_KEYWORDS = {
+    "house": ["house", "mortgage", "home", "fha", "first home", "buy a home", "buying a home", "homeowner"],
+    "car":   ["car", "auto loan", "vehicle", "truck", "suv", "lease a car", "buy a car"],
+    "business": ["business", "ein", "llc", "startup", "biz funding", "business loan", "business credit"],
+    "credit_card": ["credit card", "amex", "approved for a card", "real card", "cc"],
+    "freedom": ["collectors off", "stop the calls", "stop calling", "off my back", "leave me alone", "lawsuit", "garnish"],
+    "peace": ["peace of mind", "sleep at night", "stress", "anxiety", "tired of"],
+}
+
+_TIMELINE_PATTERNS = [
+    (r"\basap\b", "asap"),
+    (r"\b(this|next)\s+(week|month)\b", "soon"),
+    (r"\b(\d+)\s*(day|days|month|months|year|years)\b", "explicit"),
+    (r"\b(by|before|until)\s+(spring|summer|fall|winter|christmas|new year|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\b", "by_date"),
+]
+
+
+def detect_qualification_signals(message: str) -> dict:
+    """Scan an inbound message and return structured qualification signals.
+
+    Returns:
+      {
+        "is_qualified": bool,         # True if any signal landed
+        "biggest_debt": str | None,   # the matched debt phrase, lowercased
+        "goal": str | None,           # canonical goal key (house/car/business/...)
+        "timeline": str | None,       # raw timeline phrase if mentioned
+        "raw": str,                   # the original message (for audit)
+      }
+    """
+    if not message or not isinstance(message, str):
+        return {"is_qualified": False, "biggest_debt": None, "goal": None, "timeline": None, "raw": ""}
+
+    import re
+    text = message.lower().strip()
+
+    biggest_debt = None
+    for kw in _DEBT_KEYWORDS:
+        if kw in text:
+            biggest_debt = kw
+            break
+
+    goal = None
+    for canonical, keywords in _GOAL_KEYWORDS.items():
+        if any(k in text for k in keywords):
+            goal = canonical
+            break
+
+    timeline = None
+    for pat, _kind in _TIMELINE_PATTERNS:
+        m = re.search(pat, text)
+        if m:
+            timeline = m.group(0)
+            break
+
+    is_qualified = bool(biggest_debt or goal or timeline)
+
+    return {
+        "is_qualified": is_qualified,
+        "biggest_debt": biggest_debt,
+        "goal": goal,
+        "timeline": timeline,
+        "raw": message,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Already-scanned detection — fixes the IG loop where users say "I uploaded"
+# and Bully AI keeps sending them the upload link.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ALREADY_SCANNED_PATTERNS = [
+    "i uploaded", "i scanned", "i submitted", "i sent it", "i did that",
+    "i have done that", "i've done that", "ive done that", "done that",
+    "yes i uploaded", "yes uploaded", "i filled out", "i filled it out",
+    "uploaded my", "uploaded the", "uploaded all", "uploaded it",
+    "scanned already", "already scanned", "already uploaded",
+    "i used the link", "used the link u sent", "used the link you sent",
+    "did the upload", "did the scan", "ran the scan",
+]
+
+
+def detect_already_scanned(message: str) -> bool:
+    """Return True if the user is claiming to have already uploaded/scanned.
+    Used by the IG/SMS reply webhook to flip Bully AI into ALREADY-SCANNED MODE
+    instead of sending the upload link for the 5th time."""
+    if not message or not isinstance(message, str):
+        return False
+    t = message.lower()
+    return any(p in t for p in _ALREADY_SCANNED_PATTERNS)
+
+
+# Email regex for harvesting an email address out of a free-text reply
+_EMAIL_RE = r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"
+
+
+def extract_email(message: str) -> str:
+    """Pull the first email address out of a message, if any."""
+    if not message:
+        return ""
+    import re
+    m = re.search(_EMAIL_RE, message)
+    return m.group(0).lower() if m else ""
 
 
 def _sanitize_for_messaging(text: str) -> str:

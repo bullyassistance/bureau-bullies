@@ -1634,6 +1634,77 @@ def admin_check_conversions(
     }
 
 
+@app.post("/admin/funnel-stats")
+def admin_funnel_stats(token: str = Form("")):
+    """Read-only funnel snapshot — counts contacts at each stage so we can
+    see scan throughput vs conversion rate without going contact-by-contact.
+
+    Returns:
+      scans_total          — # contacts tagged 'bureau-scan'
+      scans_completed      — # contacts tagged 'bureau-scan-completed'
+      qualifier_fired      — # contacts tagged 'qualifier-fired'
+      tripwire_buyers      — # contacts tagged 'tripwire_buyer'
+      vault_buyers         — # contacts tagged 'dispute vault'
+      dfy_buyers           — sum of dfy-related purchase tags
+      conversions_total    — unique buyers (any purchase tag)
+      scan_to_buy_overlap  — # contacts with bureau-scan AND any purchase tag
+    """
+    if not _check_admin(token):
+        return {"ok": False, "error": "unauthorized"}
+
+    from ghl import GHLClient
+    try:
+        client = GHLClient()
+    except Exception as e:
+        return {"ok": False, "error": f"ghl_init_failed: {e}"}
+
+    def _ids_for(tag: str) -> set:
+        try:
+            batch = client.search_contacts_by_tag(tag, limit=500) if hasattr(client, "search_contacts_by_tag") else []
+            return {(c.get("id") or c.get("_id") or "") for c in batch if (c.get("id") or c.get("_id"))}
+        except Exception as _e:
+            logger.warning("funnel-stats tag fetch failed for %s: %s", tag, _e)
+            return set()
+
+    scan_ids = _ids_for("bureau-scan")
+    scan_done_ids = _ids_for("bureau-scan-completed")
+    qual_fired_ids = _ids_for("qualifier-fired")
+    qual_cold_ids = _ids_for("qualifier-cold")
+
+    # Real purchase tags from GHL (verified via lookup endpoint)
+    tripwire_ids = _ids_for("tripwire_buyer")
+    vault_ids = _ids_for("dispute vault")
+
+    # DFY tags — try several common variants
+    dfy_ids = set()
+    for tag in ("dfy buyer", "dfy-purchased", "purchased-dfy", "dfy-pif-paid",
+                "paid-pif", "dfy-monthly-active", "purchased-2500", "purchased-2000",
+                "purchased-1500"):
+        dfy_ids |= _ids_for(tag)
+
+    all_buyers = tripwire_ids | vault_ids | dfy_ids
+    scan_and_buy = scan_ids & all_buyers
+    qualifier_and_buy = (qual_fired_ids | qual_cold_ids) & all_buyers
+
+    return {
+        "ok": True,
+        "scans_total": len(scan_ids),
+        "scans_completed": len(scan_done_ids),
+        "qualifier_fired": len(qual_fired_ids),
+        "qualifier_cold_only": len(qual_cold_ids - qual_fired_ids),
+        "tripwire_buyers_17": len(tripwire_ids),
+        "vault_buyers_66": len(vault_ids),
+        "dfy_buyers": len(dfy_ids),
+        "conversions_total_unique": len(all_buyers),
+        "scan_to_buy_overlap": len(scan_and_buy),
+        "qualifier_to_buy_overlap": len(qualifier_and_buy),
+        "scan_conversion_rate_pct": round(100.0 * len(scan_and_buy) / max(1, len(scan_ids)), 2),
+        "qualifier_conversion_rate_pct": round(
+            100.0 * len(qualifier_and_buy) / max(1, len(qual_fired_ids | qual_cold_ids)), 2
+        ),
+    }
+
+
 @app.post("/admin/lookup-contact")
 def admin_lookup_contact(token: str = Form(""), query: str = Form("")):
     """Read-only contact lookup. Search by name, email, or phone, return the

@@ -325,10 +325,15 @@ class GHLClient:
         (vs send_sms_to_contact which would resolve a contact_id first)."""
         return self.send_sms(phone, message)
 
-    def send_sms(self, phone: str, message: str) -> bool:
-        """Send a one-off SMS to a phone number via GHL. Used for handoff alerts to Umar.
-        Returns True on success, False on failure (logged, not raised)."""
-        if not phone or not message:
+    def send_sms(self, phone: str = "", message: str = "", *, contact_id: str = "") -> bool:
+        """Send an SMS via GHL. Accepts contact_id (preferred — GHL knows the
+        right routing) OR raw phone (works if GHL can resolve to existing contact).
+
+        Returns True on success, False on failure (logged, not raised).
+        """
+        if not message:
+            return False
+        if not phone and not contact_id:
             return False
         if self.version == "v1":
             url = f"{V1_BASE}/conversations/messages"
@@ -336,19 +341,25 @@ class GHLClient:
             url = f"{V2_BASE}/conversations/messages"
         payload = {
             "type": "SMS",
-            "phone": phone,
             "message": message[:1500],
             "locationId": self.location_id,
         }
+        # Prefer contactId — GHL's preferred way to send to a known contact.
+        # Falls back to phone for ad-hoc sends to numbers not in the system.
+        if contact_id:
+            payload["contactId"] = contact_id
+        if phone:
+            payload["phone"] = phone
         try:
             r = requests.post(url, headers=self._headers, json=payload, timeout=15)
         except Exception as e:
             logger.warning("send_sms network error: %s", e)
             return False
         if r.ok:
-            logger.info("send_sms OK -> %s: %s", phone[-4:], message[:60])
+            logger.info("send_sms OK -> contact=%s phone_tail=%s msg=%r",
+                        contact_id or "(none)", phone[-4:] if phone else "", message[:60])
             return True
-        logger.warning("send_sms failed (%s): %s", r.status_code, r.text[:200])
+        logger.warning("send_sms failed (%s): %s", r.status_code, r.text[:300])
         return False
 
     # ---- Instagram DM send (direct via GHL Conversations API) -----------

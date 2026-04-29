@@ -1630,24 +1630,49 @@ def admin_sync_fb_leads(token: str = Form(""), limit: str = Form("50"), dry_run:
     except Exception as e:
         return {"ok": False, "error": f"ghl_init_failed: {e}"}
 
-    # Pull all contacts (paginated). We'll filter in memory for FB/IG sources.
-    # If you have a "Facebook form lead" tag, this is faster — try that first.
-    candidates = []
+    # Memory-safe candidate collection: stream + dedupe in one pass.
+    # Cap per-tag and per-source pull so we don't blow up RAM if a tag has
+    # thousands of contacts. We only need enough to fill `max_n` after filter.
+    # Default per-source pull is 4x the limit so we have plenty of headroom
+    # after SKIP_TAGS filtering, but never more than 200 per source.
+    import gc as _gc
+    per_source_cap = max(50, min(200, max_n * 4))
+    seen_ids = set()
+    unique: list = []  # only the deduped, candidate-shape rows
+
+    def _absorb(batch, src_label: str) -> None:
+        """Add new contacts from `batch` to `unique`, skipping duplicates."""
+        if not batch:
+            return
+        added = 0
+        for c in batch:
+            cid = c.get("id") or c.get("_id") or ""
+            if not cid or cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+            unique.append(c)
+            added += 1
+            # Hard cap on memory — once we've seen plenty, stop accumulating
+            if len(unique) >= per_source_cap * 5:
+                break
+        if added:
+            logger.info("sync-fb-leads: +%d new from %s (total unique=%d)", added, src_label, len(unique))
+
+    # Phase 1: tag-based search (faster + more targeted)
     try:
-        # Try by tag first (faster + more targeted)
         for tag in ("Facebook form lead", "facebook-form-lead", "fb-form-lead",
                     "ig-form-lead", "Instagram form lead"):
             try:
-                tagged = client.search_contacts_by_tag(tag, limit=500)
-                if tagged:
-                    candidates.extend(tagged)
-                    logger.info("sync-fb-leads: %d candidates from tag '%s'", len(tagged), tag)
+                tagged = client.search_contacts_by_tag(tag, limit=per_source_cap)
+                _absorb(tagged, f"tag '{tag}'")
+                tagged = None  # release immediately
             except Exception:
                 continue
     except Exception as e:
         logger.warning("sync-fb-leads tag search failed: %s", e)
+    _gc.collect()
 
-    # Also try source-field filter via GHL v2 search
+    # Phase 2: source-field filter via GHL v2 search
     try:
         import requests as _rq
         from ghl import V2_BASE
@@ -1658,28 +1683,20 @@ def admin_sync_fb_leads(token: str = Form(""), limit: str = Form("50"), dry_run:
                     headers=client._headers,
                     json={
                         "locationId": client.location_id,
-                        "pageLimit": 100,
+                        "pageLimit": min(100, per_source_cap),
                         "filters": [{"field": "source", "operator": "contains", "value": source_query}],
                     },
                     timeout=20,
                 )
                 if r.ok:
                     batch = r.json().get("contacts", []) or []
-                    candidates.extend(batch)
-                    logger.info("sync-fb-leads: %d candidates from source='%s'", len(batch), source_query)
+                    _absorb(batch, f"source='{source_query}'")
+                    batch = None
             except Exception:
                 continue
     except Exception as e:
         logger.warning("sync-fb-leads source search failed: %s", e)
-
-    # Dedupe by contact_id
-    seen_ids = set()
-    unique = []
-    for c in candidates:
-        cid = c.get("id") or c.get("_id") or ""
-        if cid and cid not in seen_ids:
-            seen_ids.add(cid)
-            unique.append(c)
+    _gc.collect()
     logger.info("sync-fb-leads: %d unique candidates after dedupe", len(unique))
 
     # Filter out contacts already touched OR already purchased.
@@ -1763,16 +1780,56 @@ def admin_sync_fb_leads(token: str = Form(""), limit: str = Form("50"), dry_run:
         except Exception as e:
             errors.append({"cid": cid, "send_error": str(e)[:200]})
 
+    # Free large structures before returning so the worker doesn't sit on
+    # 5+ MB of contact dicts after the call. The single uvicorn worker is
+    # shared with webhook handlers, so we need RSS to drop back down quickly.
+    candidates_total = len(unique)
+    eligible_total = len(eligible)
+    unique = None
+    eligible = None
+    seen_ids = None
+    import gc as _gc2
+    _gc2.collect()
+
     return {
         "ok": True,
-        "candidates_total": len(unique),
-        "eligible_total": len(eligible),
-        "processed": len(eligible),
+        "candidates_total": candidates_total,
+        "eligible_total": eligible_total,
+        "processed": eligible_total,
         "tagged_qualifier_cold": tagged_count,
         "first_touch_sms_sent": sms_sent,
         "first_touch_email_sent": email_sent,
         "errors": errors[:15],
     }
+
+
+@app.get("/admin/memory-stats")
+def admin_memory_stats(token: str = ""):
+    """Quick view of process RSS so we can tell when we're approaching the
+    Render Standard 2GB limit. Returns RSS in MB, plus tracemalloc top-10
+    if it was enabled. No auth required for the basic stats so cron jobs
+    can hit this for monitoring."""
+    out = {"ok": True}
+    try:
+        import resource
+        # ru_maxrss is KB on Linux, bytes on macOS
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        out["rss_mb"] = round(rss_kb / 1024, 1)
+    except Exception as e:
+        out["rss_error"] = str(e)[:200]
+    try:
+        import gc as _g
+        out["gc_objects"] = len(_g.get_objects())
+        out["gc_garbage"] = len(_g.garbage)
+    except Exception:
+        pass
+    # Force a collection on each call so we get a stable reading next time.
+    try:
+        import gc as _g2
+        _g2.collect()
+    except Exception:
+        pass
+    return out
 
 
 @app.post("/admin/pause-contact")

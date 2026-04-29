@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import List, Optional
 
 from anthropic import Anthropic

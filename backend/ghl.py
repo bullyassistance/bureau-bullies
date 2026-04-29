@@ -516,7 +516,37 @@ class GHLClient:
 
             human_signal_found = False
             human_source = ""
+            # First pass: scan ALL messages (inbound AND outbound) for pricing
+            # or business language. If a customer is replying with "1500?" or
+            # "yes 50%", that means Umar already engaged off-channel and AI must
+            # stand down — even if the system can't see Umar's outbound yet
+            # (e.g. IG → GHL sync delay).
+            import re as _re_pricing
             for msg in messages:
+                body_l = (
+                    str(msg.get("body") or msg.get("text") or msg.get("message") or "")
+                ).lower().strip()
+                if not body_l:
+                    continue
+                # Short number-only reply (price haggle)
+                if _re_pricing.match(r"^\$?\d{3,5}(?:[?!.,]?\s*(?:bro|please|ok)?)?$", body_l):
+                    human_signal_found = True
+                    human_source = "price-haggle-in-history"
+                    break
+                # Business / settlement / human-conversation phrases
+                if any(p in body_l for p in (
+                    "settlement", "50%", "habibi", "wa alaikum", "salaam",
+                    "spit that with you", "split with you", "checks come",
+                    "send the contract", "sign the agreement", "fee agreement",
+                )):
+                    human_signal_found = True
+                    human_source = "business-language-in-history"
+                    break
+            if human_signal_found:
+                # Skip the per-message loop — already found a signal
+                pass
+            else:
+              for msg in messages:
                 direction = (msg.get("direction") or msg.get("type") or "").lower()
                 if "outbound" not in direction:
                     continue
@@ -544,6 +574,25 @@ class GHLClient:
                 if _re.search(r"\$\s?\d{3,5}(?:,\d{3})?(?:\s|$|\.|!|\?|bro\b)", body_l):
                     human_signal_found = True
                     human_source = "price-negotiation"
+                    break
+
+                # Signal 5: number-only short reply that looks like price haggling
+                # ("1500?", "2000", "500 bro") — common in IG sales DMs
+                if _re.match(r"^\$?\d{3,5}(?:[?!.,]?\s*(?:bro|please|ok)?)?$", body_l.strip()):
+                    human_signal_found = True
+                    human_source = "price-haggle-short"
+                    break
+
+                # Signal 6: settlement / contract / business language Umar handles
+                business_phrases = (
+                    "settlement", "spit that with you", "split with you",
+                    "50%", "50 percent", "habibi", "salaam", "wa alaikum",
+                    "send the contract", "sign the agreement", "fee agreement",
+                    "we take", "i take", "my cut", "your cut", "checks come",
+                )
+                if any(p in body_l for p in business_phrases):
+                    human_signal_found = True
+                    human_source = "business-language"
                     break
 
             if human_signal_found:

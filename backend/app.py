@@ -2242,13 +2242,15 @@ def _send_qualifier_first_touch(client, contact_id: str, fn: str, email: str, ph
     result = {"sms_ok": False, "email_ok": False, "errors": []}
     fn_safe = (fn or "there").strip()
 
-    # SMS #1 — only if we have a phone number.
-    # GHLClient.send_sms takes (phone, message) — not contact_id.
-    if phone:
+    # SMS #1 — try contact_id-routed first (GHL preferred), fall back to phone.
+    if phone or contact_id:
         try:
             sms_body = _QUALIFIER_SMS_1.format(fn=fn_safe)
-            ok = client.send_sms(phone, sms_body) if hasattr(client, "send_sms") else False
+            ok = client.send_sms(phone=phone, message=sms_body, contact_id=contact_id) \
+                 if hasattr(client, "send_sms") else False
             result["sms_ok"] = bool(ok)
+            if not ok:
+                result["errors"].append("sms: send_sms returned False (check Render logs)")
         except Exception as e:
             result["errors"].append(f"sms: {e}")
 

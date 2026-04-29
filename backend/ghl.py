@@ -320,6 +320,11 @@ class GHLClient:
         return False
 
     # ---- SMS send (direct via GHL Conversations API) --------------------
+    def send_sms_to_number(self, phone: str, message: str) -> bool:
+        """Alias for send_sms — explicit name for sending to a raw phone number
+        (vs send_sms_to_contact which would resolve a contact_id first)."""
+        return self.send_sms(phone, message)
+
     def send_sms(self, phone: str, message: str) -> bool:
         """Send a one-off SMS to a phone number via GHL. Used for handoff alerts to Umar.
         Returns True on success, False on failure (logged, not raised)."""

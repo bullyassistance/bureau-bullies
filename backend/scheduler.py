@@ -31,6 +31,7 @@ Storage: /tmp/bullies_scheduled_emails.json by default. Override with
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
 import os
@@ -361,9 +362,16 @@ def _auto_rebuild_queue_from_ghl() -> int:
     it from GHL contacts who already have the cr_email_N_subject/body fields
     populated from past scans.
 
-    This is the bullet-proof persistence layer: even if /tmp gets nuked on
-    every redeploy, the per-contact email schedule is durable on the GHL
-    contact itself, and we self-heal on every app start.
+    Memory-safe: loads the DB ONCE, builds all rows in a local list, saves ONCE
+    at the end. The previous version called schedule_email_drip() per-contact,
+    which load_db()'d and save_db()'d the (growing) JSON file 300+ times — that
+    was the OOM cause. This rewrite is O(N) memory, single-shot I/O.
+
+    Also caps the contacts list to BB_AUTO_REBUILD_MAX_AGE_DAYS days (default 60)
+    so we don't try to rebuild drips for contacts whose scan was a year ago and
+    whose cadence is fully expired anyway. Older scans are filtered out before
+    enqueue (their drip is already done — schedule_email_drip would mark all
+    rows skipped-too-old).
 
     Returns the number of contacts re-enqueued.
     """
@@ -381,11 +389,19 @@ def _auto_rebuild_queue_from_ghl() -> int:
         logger.warning("Scheduler boot: GHL client init failed, can't auto-rebuild: %s", e)
         return 0
 
+    # Cap on candidate age — older scans don't need rebuilding (their cadence
+    # has already expired and every email would be marked skipped-too-old).
+    max_age_days = int(os.getenv("BB_AUTO_REBUILD_MAX_AGE_DAYS", "60"))
+    age_cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+
     try:
         contacts = client.search_contacts_by_tag("bureau-scan") if hasattr(client, "search_contacts_by_tag") else []
     except Exception as e:
         logger.warning("Scheduler boot: search_contacts_by_tag failed: %s", e)
         return 0
+
+    total_contacts = len(contacts or [])
+    logger.info("Scheduler boot: %d contacts tagged bureau-scan, filtering & rebuilding...", total_contacts)
 
     # GHL v2 returns customFields as [{id, value}] without the field key,
     # so build an id→key reverse map first.
@@ -399,9 +415,22 @@ def _auto_rebuild_queue_from_ghl() -> int:
     except Exception as e:
         logger.warning("Scheduler boot: could not load custom field map: %s", e)
 
+    # Build all new rows in this list — save once at end (instead of N times).
+    new_rows: List[dict] = []
     enqueued = 0
     skipped = 0
-    for c in (contacts or []):
+    skipped_old = 0
+    now = datetime.now(timezone.utc)
+    too_old_cutoff = now - timedelta(days=MAX_PAST_DUE_DAYS)
+
+    # Iterate without holding the full list in scope twice — pop from the
+    # original list as we go so memory drops as we progress.
+    contact_iter = list(contacts or [])
+    contacts = None  # release the original reference
+    gc.collect()
+
+    while contact_iter:
+        c = contact_iter.pop()  # process from end, drops the slot
         cid = c.get("id") or c.get("_id")
         email_addr = c.get("email") or c.get("emailAddress")
         if not cid or not email_addr:
@@ -418,6 +447,27 @@ def _auto_rebuild_queue_from_ghl() -> int:
             v = item.get("value") or item.get("field_value") or item.get("fieldValue") or ""
             if k:
                 cf_map[k] = v
+
+        # Resolve scan time
+        scan_at_iso = (cf_map.get("scan_completed_at") or cf_map.get("cr_scan_completed_at")
+                       or c.get("dateAdded") or c.get("createdAt") or "")
+        scan_dt = None
+        if scan_at_iso:
+            try:
+                scan_dt = datetime.fromisoformat(str(scan_at_iso).replace("Z", "+00:00"))
+                if scan_dt.tzinfo is None:
+                    scan_dt = scan_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                scan_dt = None
+        if scan_dt is None:
+            scan_dt = now
+
+        # Age cap — skip contacts whose scan is too old to bother rebuilding
+        if scan_dt < age_cutoff:
+            skipped_old += 1
+            continue
+
+        # Pull the 7 cached email subjects/bodies
         emails = []
         for i in range(1, 8):
             subj = cf_map.get(f"cr_email_{i}_subject", "")
@@ -428,27 +478,61 @@ def _auto_rebuild_queue_from_ghl() -> int:
             skipped += 1
             continue
 
-        # Use the contact's scan_completed_at if available, otherwise approximate
-        # from createdAt so the cadence offsets land on the correct dates.
-        scan_at_iso = cf_map.get("scan_completed_at") or cf_map.get("cr_scan_completed_at") or c.get("dateAdded") or c.get("createdAt") or ""
-        scan_dt = None
-        if scan_at_iso:
-            try:
-                scan_dt = datetime.fromisoformat(str(scan_at_iso).replace("Z", "+00:00"))
-                if scan_dt.tzinfo is None:
-                    scan_dt = scan_dt.replace(tzinfo=timezone.utc)
-            except Exception:
-                scan_dt = None
+        # Build rows directly into new_rows (no DB read/write per contact).
+        contact_enqueued_any = False
+        for i, email in enumerate(emails):
+            if i >= len(CADENCE_SECONDS):
+                break
+            send_at = scan_dt + timedelta(seconds=CADENCE_SECONDS[i])
+            if send_at < too_old_cutoff:
+                # email's cadence already expired — record as skipped so we
+                # don't fire an old "Day 14" right after a "Day 7"
+                status = "skipped-too-old"
+            else:
+                status = "pending"
+                contact_enqueued_any = True
+            new_rows.append({
+                "id": f"{cid}-{i+1}-{int(scan_dt.timestamp())}",
+                "contact_id": cid,
+                "contact_email": email_addr,
+                "first_name": fn or "",
+                "email_index": i + 1,
+                "day": email.get("day", CADENCE_SECONDS[i] // 86400),
+                "subject": email.get("subject", ""),
+                "body": email.get("body", ""),
+                "send_at": send_at.isoformat(),
+                "status": status,
+                "created_at": scan_dt.isoformat(),
+            })
+        if contact_enqueued_any:
+            enqueued += 1
+        else:
+            # All 7 were marked skipped-too-old — drop them so we don't bloat
+            # the DB with dead rows. Walk back and remove the rows we just added.
+            new_rows = [r for r in new_rows if r["contact_id"] != cid or r["created_at"] != scan_dt.isoformat()]
 
-        try:
-            n = schedule_email_drip(cid, email_addr, fn, emails, scan_time=scan_dt)
-            if n:
-                enqueued += 1
-        except Exception as e:
-            logger.warning("Auto-rebuild: schedule_email_drip failed for %s: %s", cid, e)
+        # Periodic gc to keep RSS bounded on large rebuilds
+        if (enqueued + skipped + skipped_old) % 50 == 0:
+            gc.collect()
 
-    logger.info("Scheduler boot: auto-rebuild done — enqueued=%d skipped=%d total_contacts=%d",
-                enqueued, skipped, len(contacts or []))
+    # Save once — combine existing rows (the dedup case where pending was 0
+    # but historical sent/failed rows still exist) with new rows.
+    if new_rows:
+        # Merge against any sent/failed rows already in the DB
+        keep = [r for r in rows if r.get("status") in ("sent", "failed", "skipped-too-old", "admin-cancelled")]
+        _save_db(keep + new_rows)
+
+    # Free large structures before returning
+    contact_iter = None
+    new_rows = None
+    rows = None
+    id_to_key = None
+    gc.collect()
+
+    logger.info(
+        "Scheduler boot: auto-rebuild done — enqueued=%d skipped=%d skipped_old=%d total_contacts=%d (max_age=%dd)",
+        enqueued, skipped, skipped_old, total_contacts, max_age_days,
+    )
     return enqueued
 
 

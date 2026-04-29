@@ -1682,10 +1682,22 @@ def admin_sync_fb_leads(token: str = Form(""), limit: str = Form("50"), dry_run:
             unique.append(c)
     logger.info("sync-fb-leads: %d unique candidates after dedupe", len(unique))
 
-    # Filter out contacts already touched
-    SKIP_TAGS = {"qualifier-cold", "qualifier-fired", "bureau-scan",
-                 "bureau-scan-completed", "pause-ai", "manual-mode",
-                 "unsubscribed", "do-not-contact", "qualified"}
+    # Filter out contacts already touched OR already purchased.
+    # Purchase tags here MUST mirror _PURCHASE_TAGS so we don't spam buyers.
+    SKIP_TAGS = {
+        # Already in qualifier/scan flow
+        "qualifier-cold", "qualifier-fired", "bureau-scan",
+        "bureau-scan-completed", "pause-ai", "manual-mode",
+        "unsubscribed", "do-not-contact", "qualified",
+        # Already paid for something — don't re-pitch them
+        "purchased-toolkit", "purchased-collection-toolkit", "$17-purchased",
+        "toolkit-purchased", "ck-purchased",
+        "purchased-vault", "purchased-dispute-vault", "$66-purchased",
+        "vault-purchased",
+        "purchased-dfy", "dfy-purchased", "dfy-pif-paid", "pif-paid", "paid-pif",
+        "dfy-monthly-active", "purchased-1500", "purchased-2000", "purchased-2500",
+        "notified-conversion",
+    }
 
     eligible = []
     for c in unique:

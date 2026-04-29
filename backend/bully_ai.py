@@ -766,7 +766,12 @@ def chat(
     if isinstance(contact_context, dict):
         _cid = contact_context.get("contact_id") or contact_context.get("id") or ""
         _channel = contact_context.get("channel") or contact_context.get("_channel") or "sms"
-    reply = sanitize_outbound_for_pii(reply, contact_id=_cid, channel=_channel)
+    reply = sanitize_outbound_for_pii(
+        reply,
+        contact_id=_cid,
+        channel=_channel,
+        contact_context=contact_context,
+    )
     logger.info("Bully AI replied: %s", reply[:120])
     return reply
 
@@ -1002,24 +1007,203 @@ def _strip_phone_numbers(text: str) -> tuple[str, list]:
     return cleaned, matches
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CRITICAL: Scan-data leak detection.
+# When a contact has NOT uploaded a credit report, the AI must NEVER reference
+# specific collectors, dollar amounts, or claim to know what's "on their
+# report." If it does, that's hallucinated data — possibly leaked from another
+# contact's scan context. This is a privacy/liability nightmare.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Common collector / debt-buyer names that ONLY belong in a reply if the
+# contact actually scanned (verified via cr_top_collection_name etc).
+_COLLECTOR_NAMES = (
+    "westlake", "midland", "midland funding", "midland credit",
+    "lvnv", "lvnv funding",
+    "portfolio recovery", "portfolio recovery associates",
+    "cavalry", "cavalry portfolio", "cavalry spv",
+    "jefferson capital", "jefferson", "jcap",
+    "encore capital", "encore",
+    "asset acceptance", "sherman financial", "cach llc",
+    "unifin", "convergent", "hunter warfield",
+    "credit corp solutions", "first national collection",
+    "i.c. system", "ic system", "i.c.system",
+    "client services inc", "convergent outsourcing",
+    "navy federal", "synchrony", "comenity", "credit one",
+    "discover charge-off", "amex charge-off", "citi charge-off",
+)
+
+# Phrases that ONLY make sense when the contact has uploaded a scan.
+_SCAN_REFERENCE_PHRASES = (
+    "your scan flagged", "your scan shows", "your scan found",
+    "your report shows", "your report flagged", "your report found",
+    "the top item on your report", "the top account on your report",
+    "your top item is", "your highest-balance",
+    "we flagged", "we found on your report",
+    "based on your scan", "based on your report",
+    "the {amount} ", "the $",  # caught by regex below too
+)
+
+# Dollar amounts above $99 that are likely account-balance references
+# (vs. our pricing — $17, $66, $229, $2500 are SAFE because they're our products).
+_SAFE_PRODUCT_PRICES = {17, 66, 229, 333, 1500, 2000, 2500, 5000}
+_DOLLAR_AMOUNT_REGEX = re.compile(r"\$\s*([\d,]+(?:\.\d{2})?)\b")
+
+
+def _has_real_scan_data(ctx: Optional[dict]) -> bool:
+    """Return True iff the contact_context contains evidence of an actual scan.
+    We require at least ONE of: violations_count > 0, top_collection_name set,
+    total_leverage > 0. If none of those are present, we treat the contact as
+    having NO SCAN — and the AI is forbidden from inventing scan findings.
+    """
+    if not isinstance(ctx, dict):
+        return False
+    v = str(ctx.get("cr_violations_count") or ctx.get("violations_count") or "").strip()
+    tc = str(ctx.get("cr_top_collection_name") or ctx.get("top_collection_name") or "").strip()
+    tl = str(ctx.get("cr_total_leverage") or ctx.get("total_leverage") or "").strip()
+    try:
+        if v and int(float(v)) > 0:
+            return True
+    except Exception:
+        pass
+    if tc and tc.lower() not in ("", "none", "null", "n/a", "--"):
+        return True
+    try:
+        if tl and float(tl.replace("$", "").replace(",", "")) > 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _detect_scan_data_leaks(text: str) -> list[str]:
+    """Return a list of hallucinated scan-references found in `text`.
+    Caller decides what to do with them based on whether contact actually scanned.
+    """
+    if not text:
+        return []
+    leaks: list[str] = []
+    low = text.lower()
+    # 1. Collector names (specific creditor mentioned by name)
+    for name in _COLLECTOR_NAMES:
+        if name in low:
+            leaks.append(f"collector:{name}")
+    # 2. Scan-reference phrases (e.g. "your scan flagged")
+    for phrase in _SCAN_REFERENCE_PHRASES:
+        # Skip the regex placeholders
+        if phrase.startswith("the {") or phrase.strip() == "the $":
+            continue
+        if phrase in low:
+            leaks.append(f"phrase:{phrase}")
+    # 3. Dollar amounts > $99 that aren't our product prices
+    for m in _DOLLAR_AMOUNT_REGEX.finditer(text):
+        raw = m.group(1).replace(",", "")
+        try:
+            amt = float(raw)
+        except Exception:
+            continue
+        if amt < 100:
+            continue
+        if int(amt) in _SAFE_PRODUCT_PRICES:
+            continue
+        leaks.append(f"dollar:${m.group(1)}")
+    return leaks
+
+
+_SAFE_NO_SCAN_REPLY = (
+    "Hey {fn}, before I dive in, can you upload your report at "
+    "https://bullyaiagent.com/#upload? Once I see your actual data I can tell "
+    "you exactly which accounts to attack. Screenshots from Credit Karma or the "
+    "Experian app work too if pulling the full report is a hassle."
+)
+
+
+def _strip_scan_data_when_no_scan(
+    text: str,
+    contact_context: Optional[dict],
+) -> tuple[str, list[str]]:
+    """If contact has NO scan data but the text contains specific scan-like
+    references (collector names, scan-reference phrases, large $ amounts),
+    REPLACE the entire reply with a safe fallback that asks them to upload.
+
+    Returns (cleaned_text, leaks_list). leaks_list is non-empty only when
+    something got blocked.
+    """
+    if _has_real_scan_data(contact_context):
+        return text, []  # contact has scanned — references are legitimate
+    leaks = _detect_scan_data_leaks(text)
+    if not leaks:
+        return text, []
+    # Block: replace the entire message with the safe fallback
+    fn = ""
+    if isinstance(contact_context, dict):
+        fn = (contact_context.get("first_name")
+              or contact_context.get("firstName")
+              or contact_context.get("fn")
+              or "there")
+    return _SAFE_NO_SCAN_REPLY.format(fn=fn or "there"), leaks
+
+
 def sanitize_outbound_for_pii(
     text: str,
     *,
     contact_id: str = "",
     channel: str = "sms",
+    contact_context: Optional[dict] = None,
 ) -> str:
     """Last-line defense before any AI message goes out to a customer.
 
     1. Strip markdown / em dashes via _sanitize_for_messaging.
     2. Detect + replace any phone-like sequence (NEVER share numbers).
-    3. If a phone was stripped: log loudly, tag the contact pause-ai (so the
-       AI shuts up immediately on this thread), and SMS-alert Umar at
-       UMAR_NOTIFY_PHONE so a human can step in.
+    3. **CRITICAL**: detect scan-data leaks. If the contact has NO scan
+       in their context (no cr_violations_count, no top_collection_name,
+       no leverage), but the AI mentioned a specific collector name,
+       large dollar amount, or "your scan flagged"-type phrase — REPLACE
+       the entire message with a safe upload-prompt and pause-ai the
+       contact. This prevents Sterling-style data leaks where Bully AI
+       mentions another contact's scan findings.
+    4. If anything was stripped: log loudly, tag the contact pause-ai,
+       SMS-alert Umar at UMAR_NOTIFY_PHONE.
 
-    Returns the cleaned text. Always safe to send — never contains a phone
-    number even if the model invented one.
+    Returns the cleaned text. Always safe to send.
     """
     cleaned = _sanitize_for_messaging(text or "")
+
+    # SCAN-DATA LEAK CHECK (run FIRST — if we replace the message, no point
+    # running phone strip on the original).
+    cleaned, scan_leaks = _strip_scan_data_when_no_scan(cleaned, contact_context)
+    if scan_leaks:
+        logger.error(
+            "SCAN-LEAK BLOCK: AI referenced scan data for non-scan contact "
+            "(channel=%s contact=%s leaks=%r). Replaced with safe upload prompt.",
+            channel, contact_id, scan_leaks,
+        )
+        # Tag pause-ai + ai-fabricated-scan-data so this thread is frozen
+        try:
+            if contact_id:
+                from ghl import GHLClient
+                _client_sl = GHLClient()
+                _client_sl.add_tags(contact_id, ["pause-ai", "ai-fabricated-scan-data"])
+        except Exception as _e:
+            logger.warning("SCAN-LEAK BLOCK: failed to auto-pause contact: %s", _e)
+        # Alert Umar
+        try:
+            notify_phone = os.getenv("UMAR_NOTIFY_PHONE", "").strip()
+            if notify_phone:
+                from ghl import GHLClient
+                _client_alert = GHLClient()
+                alert = (
+                    "[Bully AI CRITICAL] AI tried to leak scan data on a "
+                    f"{channel} thread for non-scan contact (id={contact_id[:8]}...). "
+                    f"Leaks: {', '.join(scan_leaks[:3])}. Replaced with safe "
+                    f"upload prompt + paused-ai tag applied."
+                )
+                _client_alert.send_sms(phone=notify_phone, message=alert[:1500])
+        except Exception as _e:
+            logger.warning("SCAN-LEAK BLOCK: alert SMS failed: %s", _e)
+        # We've replaced the message — phone strip on safe text is a no-op
+        return cleaned
+
     cleaned, stripped = _strip_phone_numbers(cleaned)
     if stripped:
         logger.warning(

@@ -1484,10 +1484,20 @@ def _purchase_product_from_tags(tags: list) -> str:
 
 
 @app.post("/admin/check-conversions")
-def admin_check_conversions(token: str = Form(""), days: str = Form("7"), limit: str = Form("50")):
-    """Find contacts who came through the Meta lead funnel AND purchased,
-    but haven't been notified yet. Send Umar an SMS+email with details.
-    Tag them notified-conversion so we don't re-notify.
+def admin_check_conversions(
+    token: str = Form(""),
+    days: str = Form("7"),
+    limit: str = Form("50"),
+    meta_only: str = Form("0"),
+):
+    """Find contacts with a purchase tag who haven't been notified yet, and
+    SMS+email Umar about each one. Tag them notified-conversion so we don't
+    re-notify on subsequent runs.
+
+    Args:
+      meta_only: "1" to only notify on Meta-funnel-tagged buyers (legacy
+        behavior). Default "0" — notify on ALL purchases regardless of source
+        (organic site, scan upload, etc). User wants to know about EVERY sale.
     """
     if not _check_admin(token):
         return {"ok": False, "error": "unauthorized"}
@@ -1495,6 +1505,7 @@ def admin_check_conversions(token: str = Form(""), days: str = Form("7"), limit:
         n_limit = int(limit)
     except Exception:
         n_limit = 50
+    is_meta_only = (meta_only or "0").strip() == "1"
 
     from ghl import GHLClient
     try:
@@ -1521,8 +1532,8 @@ def admin_check_conversions(token: str = Form(""), days: str = Form("7"), limit:
 
     for cid, c in list(candidates.items())[:n_limit]:
         tags_l = [str(t).lower() for t in (c.get("tags") or [])]
-        # Must have come through the Meta funnel
-        if not any(t in _META_FUNNEL_TAGS for t in tags_l):
+        # Optional Meta-only filter (off by default — user wants ALL conversions)
+        if is_meta_only and not any(t in _META_FUNNEL_TAGS for t in tags_l):
             skipped.append({"cid": cid, "reason": "not-meta-funnel"})
             continue
         # Skip if already notified
@@ -1536,8 +1547,12 @@ def admin_check_conversions(token: str = Form(""), days: str = Form("7"), limit:
         email_addr = c.get("email") or "(no email)"
         phone = c.get("phone") or "(no phone)"
 
+        # Source label so user can tell where the sale came from at a glance
+        is_meta = any(t in _META_FUNNEL_TAGS for t in tags_l)
+        source_label = "META" if is_meta else "ORGANIC/SCAN"
+
         sms_body = (
-            f"💰 META FUNNEL CONVERSION 💰\n"
+            f"💰 CONVERSION ({source_label}) 💰\n"
             f"{full_name} just bought: {product}\n"
             f"Email: {email_addr}\n"
             f"Phone: {phone}\n"
@@ -1553,15 +1568,39 @@ def admin_check_conversions(token: str = Form(""), days: str = Form("7"), limit:
 
         sent_sms = False
         sent_email = False
+        sms_error = ""
         if notify_phone and hasattr(client, "send_sms_to_number"):
             try:
                 sent_sms = client.send_sms_to_number(notify_phone, sms_body)
+                if not sent_sms:
+                    sms_error = "send_sms returned False (notify_phone may not be a GHL contact)"
+                    logger.warning("notify SMS to %s returned False — phone may not be a contact", notify_phone)
             except Exception as e:
-                logger.warning("notify SMS failed: %s", e)
+                sms_error = str(e)[:200]
+                logger.warning("notify SMS exception: %s", e)
 
-        # Fall back: send via Anthropic-side email or backup transport
-        # We can use the GHL send_email helper if we've got a notify "contact"
-        # For now, just log and mark.
+        # Fallback: write a notification log row to /var/data so we always have
+        # an audit trail, even if SMS silently failed.
+        try:
+            from pathlib import Path
+            log_dir = Path("/var/data") if Path("/var/data").exists() else Path("/tmp")
+            log_path = log_dir / "conversions_log.jsonl"
+            with log_path.open("a") as f:
+                f.write(json.dumps({
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "contact_id": cid,
+                    "name": full_name,
+                    "email": email_addr,
+                    "phone": phone,
+                    "product": product,
+                    "source": source_label,
+                    "tags": c.get("tags") or [],
+                    "sms_sent": sent_sms,
+                    "sms_error": sms_error,
+                }) + "\n")
+        except Exception as _e:
+            logger.warning("conversions_log write failed: %s", _e)
+
         try:
             client.add_tags(cid, ["notified-conversion"])
         except Exception:
@@ -1592,6 +1631,71 @@ def admin_check_conversions(token: str = Form(""), days: str = Form("7"), limit:
         "details": notified,
         "skipped_first_10": skipped[:10],
     }
+
+
+@app.post("/admin/lookup-contact")
+def admin_lookup_contact(token: str = Form(""), query: str = Form("")):
+    """Read-only contact lookup. Search by name, email, or phone, return the
+    first match's tags + source metadata WITHOUT modifying the contact.
+
+    Use case: "did Craig Morgan come from Meta?" — answer comes from real GHL
+    data, no assumptions, no auto-tagging.
+    """
+    if not _check_admin(token):
+        return {"ok": False, "error": "unauthorized"}
+    if not query:
+        return {"ok": False, "error": "pass query="}
+
+    from ghl import GHLClient
+    try:
+        client = GHLClient()
+    except Exception as e:
+        return {"ok": False, "error": f"ghl_init_failed: {e}"}
+
+    # Use the same v2 search the rest of the app uses
+    import requests as _rq
+    try:
+        from ghl import V2_BASE
+        r = _rq.post(
+            f"{V2_BASE}/contacts/search",
+            headers=client._headers,
+            json={
+                "locationId": client.location_id,
+                "pageLimit": 5,
+                "query": query,
+            },
+            timeout=15,
+        )
+        if not r.ok:
+            return {"ok": False, "error": f"search_http_{r.status_code}", "body": r.text[:300]}
+        contacts = r.json().get("contacts", []) or []
+    except Exception as e:
+        return {"ok": False, "error": f"search_exc: {str(e)[:200]}"}
+
+    if not contacts:
+        return {"ok": True, "matched": False, "query": query, "results": []}
+
+    # Project just the fields needed to answer "where did this lead come from"
+    results = []
+    for c in contacts[:5]:
+        tags_lower = [str(t).lower() for t in (c.get("tags") or [])]
+        is_meta = any(t in _META_FUNNEL_TAGS for t in tags_lower)
+        is_purchaser = any(t in _PURCHASE_TAGS for t in tags_lower)
+        results.append({
+            "contact_id": c.get("id") or c.get("_id"),
+            "name": (c.get("contactName") or
+                     f"{c.get('firstName','')} {c.get('lastName','')}").strip(),
+            "email": c.get("email") or "",
+            "phone": c.get("phone") or "",
+            "tags": c.get("tags") or [],
+            "source": c.get("source") or c.get("contactSource") or "(no source field)",
+            "type": c.get("type") or "",
+            "date_added": c.get("dateAdded") or c.get("createdAt") or "",
+            "is_meta_funnel": is_meta,
+            "is_purchaser": is_purchaser,
+            "notified_already": "notified-conversion" in tags_lower,
+        })
+    return {"ok": True, "matched": True, "query": query, "result_count": len(results), "results": results}
 
 
 @app.post("/admin/sync-fb-leads")

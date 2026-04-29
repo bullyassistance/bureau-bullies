@@ -512,6 +512,14 @@ class GHLClient:
                 "send the cash app", "venmo", "zelle me", "send to my", "card link",
                 # Personal acknowledgments
                 "appreciate you", "i appreciate you", "got you", "i got you",
+                # Casual NO-text — these are humans declining or deflecting
+                "i don't do", "i dont do", "i'm not doing", "im not doing",
+                "not right now", " rn ", " rn.", " rn?", " rn!", " rn,",
+                "hey bro ", "ok bro", "yo bro",
+                "habibi", "wa alaikum", "salaam",
+                # Umar's specific negotiating words
+                "back up to $", "back to $", "im not going to ", "i'm not going to ",
+                "yes 50%", "yes 50 ", "no 50%", "actually $",
             )
 
             human_signal_found = False
@@ -553,14 +561,38 @@ class GHLClient:
                 source = (msg.get("source") or msg.get("messageType") or "").lower()
                 body_l = (
                     str(msg.get("body") or msg.get("text") or msg.get("message") or "")
-                ).lower()
+                ).lower().strip()
+                user_id = msg.get("userId") or msg.get("user_id") or msg.get("addedBy") or ""
 
-                # Signal 2: outbound from a non-API source = human
+                # Signal 2a: ANY userId on an outbound = a human in GHL agent UI sent it
+                # This is the strongest signal because the AI sends via API (no userId).
+                if user_id:
+                    human_signal_found = True
+                    human_source = f"userId:{str(user_id)[:20]}"
+                    break
+
+                # Signal 2b: outbound from a non-API source = human
                 is_api_source = any(s in source for s in ai_sources)
                 if not is_api_source and source:
                     human_signal_found = True
                     human_source = source
                     break
+
+                # Signal 2c: outbound with NO source at all + non-trivial body
+                # (likely IG/SMS native message GHL synced without source metadata)
+                if not source and len(body_l) > 15:
+                    # AI templates ALL start with specific patterns. If none match,
+                    # treat as human-typed.
+                    ai_template_starts = (
+                        "hey ", "hi ", "umar — ", "umar, ", "umar's", "yo ",
+                        "got it,", "perfect.", "real talk", "here's why",
+                        "looking at your file", "the play is", "honest answer",
+                    )
+                    starts_like_ai = any(body_l.startswith(p) for p in ai_template_starts)
+                    if not starts_like_ai:
+                        human_signal_found = True
+                        human_source = "no-source-non-template-body"
+                        break
 
                 # Signal 3: takeover language in body, regardless of source
                 if any(p in body_l for p in takeover_phrases):

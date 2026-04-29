@@ -1939,24 +1939,23 @@ def admin_scheduler_status(token: str = ""):
 # to avoid re-firing SMS #1 on the same lead.
 
 _QUALIFIER_SMS_1 = (
-    "Hey {fn}, Umar from Bureau Bullies. Saw you grabbed the 3 Day Challenge. "
-    "Quick question before I send anything — what's the #1 thing on your "
-    "credit report you want gone? Collection, late, charge-off, repo, or "
-    "something else?"
+    "Hey {fn}, Umar here from Bureau Bullies. Real quick before I dive in, "
+    "what's been weighing on you most about your credit right now? Just want "
+    "to know how to actually help."
 )
 
-_QUALIFIER_EMAIL_1_SUBJECT = "{fn}, before I help you, one question"
+_QUALIFIER_EMAIL_1_SUBJECT = "{fn}, real quick before I help"
 _QUALIFIER_EMAIL_1_BODY = (
     "Hi {fn},\n\n"
-    "Umar from Bureau Bullies. You filled out the 3 Day Challenge a few minutes "
-    "ago, so I just sent you a quick text too.\n\n"
-    "Before I send you anything else, I need to know one thing — what's the #1 "
-    "item on your credit report you want gone? Most people I work with have "
-    "one specific account that's eating their score: a collection from "
-    "Portfolio Recovery, a charge-off from Capital One, a repo, a 90-day late "
-    "from a hospital bill. Tell me yours and I'll send you the exact playbook "
-    "for that account.\n\n"
-    "You can reply right to this email, or text me back at the number that "
+    "Umar from Bureau Bullies. I just texted you too, but wanted to send this "
+    "in case you check email first.\n\n"
+    "Before I send you anything else, I want to know what's actually going on "
+    "with you. Credit stuff is personal. People hold a lot of stress around it. "
+    "What's been weighing on you most right now? A specific account, a goal "
+    "you're locked out of, a recent denial, collectors calling, or the score "
+    "itself? No wrong answer. Tell me where you're at and I'll point you to "
+    "the right move.\n\n"
+    "You can reply right to this email or text me back at the number that "
     "just texted you. Same person, same response.\n\n"
     "Talk soon,\n"
     "Umar\n"

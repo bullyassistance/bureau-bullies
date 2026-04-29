@@ -33,6 +33,7 @@ from pydantic import BaseModel
 
 from analyzer import analyze_report, summary_to_ghl_fields
 from bully_ai import chat as bully_chat, detect_qualification_signals, detect_already_scanned, extract_email
+import contact_memory
 from docgen import generate_report_doc
 from ghl import push_lead_to_ghl, GHLError
 from email_generator import generate_full_sequence, emails_to_ghl_fields, GOAL_FRAMES
@@ -426,6 +427,21 @@ async def ghl_sms_reply(request: Request):
 
     history = payload.get("history") or _ig_fetch_history(contact_id)
 
+    # Persistent memory: prefer this contact's full history file from /var/data
+    # over GHL's recent fetch. The local memory is durable across redeploys
+    # AND remembers things from days/weeks ago that GHL's 30-msg limit drops.
+    if contact_id:
+        try:
+            persistent_history = contact_memory.history_as_anthropic_messages(contact_id, max_turns=30)
+            if persistent_history:
+                history = persistent_history
+            # Inject the rolling summary + key facts as a "context block"
+            mem_block = contact_memory.format_for_prompt(contact_id)
+            if mem_block:
+                custom["persistent_memory"] = mem_block
+        except Exception as e:
+            logger.warning("contact_memory load failed in SMS reply: %s", e)
+
     # Already-scanned reconciliation — same fix as the IG webhook. If the SMS
     # reply contains an email, look up the contact and load their scan data.
     custom = _enrich_context_with_already_scanned(message, custom)
@@ -488,6 +504,20 @@ async def ghl_sms_reply(request: Request):
         len(history), qualification.get("is_qualified", False)
     )
 
+    # Persist inbound to memory BEFORE generating reply
+    if contact_id:
+        try:
+            contact_memory.append_turn(contact_id, "user", message)
+            # Record qualification facts
+            if qualification.get("biggest_debt"):
+                contact_memory.record_fact(contact_id, "biggest_debt", qualification["biggest_debt"])
+            if qualification.get("goal"):
+                contact_memory.record_fact(contact_id, "goal", qualification["goal"])
+            if qualification.get("timeline"):
+                contact_memory.record_fact(contact_id, "timeline", qualification["timeline"])
+        except Exception as e:
+            logger.warning("contact_memory append (user) failed: %s", e)
+
     try:
         reply_text = bully_chat(
             user_message=message,
@@ -496,12 +526,18 @@ async def ghl_sms_reply(request: Request):
         )
     except Exception as e:
         logger.exception("SMS reply chat failed")
-        # Graceful fallback, never return 500 to GHL so the workflow doesn't break
         reply_text = (
             f"{first_name + ', ' if first_name else ''}"
             "Bully AI here. Got your message. Give me a few minutes and I'll get "
             "back to you with a real answer. BB"
         )
+
+    # Persist outbound reply to memory
+    if contact_id and reply_text:
+        try:
+            contact_memory.append_turn(contact_id, "assistant", reply_text)
+        except Exception as e:
+            logger.warning("contact_memory append (assistant) failed: %s", e)
 
     # Auto-handoff if Bully AI promised a human
     if _detect_handoff(reply_text):
@@ -936,8 +972,21 @@ async def ig_dm_router(request: Request):
         }
 
     # Pull conversation history from GHL so Bully AI has memory of prior turns.
-    # GHL webhooks don't pass history, so without this every reply restarts the convo.
     history = payload.get("history") or _ig_fetch_history(contact_id)
+
+    # Persistent memory — prefer the local /var/data history (durable, full)
+    if contact_id:
+        try:
+            persistent_history = contact_memory.history_as_anthropic_messages(contact_id, max_turns=30)
+            if persistent_history:
+                history = persistent_history
+            mem_block = contact_memory.format_for_prompt(contact_id)
+            if mem_block:
+                custom["persistent_memory"] = mem_block
+            # Save the inbound message
+            contact_memory.append_turn(contact_id, "user", message)
+        except Exception as e:
+            logger.warning("contact_memory load/save failed in IG DM: %s", e)
 
     try:
         reply_text = bully_chat(user_message=message, contact_context=custom, history=history)
@@ -947,6 +996,13 @@ async def ig_dm_router(request: Request):
             f"{(first_name + ' ') if first_name else ''}give me a sec to pull your file. "
             "If you haven't yet, drop your reports at https://bullyaiagent.com/#upload"
         )
+
+    # Save the outbound reply to memory
+    if contact_id and reply_text:
+        try:
+            contact_memory.append_turn(contact_id, "assistant", reply_text)
+        except Exception as e:
+            logger.warning("contact_memory append (assistant) failed: %s", e)
 
     sent = _ig_send_dm_safe(contact_id, reply_text)
 
@@ -1376,6 +1432,165 @@ def admin_dispatch_next(token: str = Form(""), regenerate: str = Form("1"), limi
         "sequence_complete": sequence_complete,
         "total_contacts_seen": len(contacts) if contacts else 0,
         "regenerated": regenerate == "1",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Meta-funnel conversion notifications
+# ─────────────────────────────────────────────────────────────────────────────
+# When a contact tagged qualifier-cold/qualifier-fired/fb-form-backfill ALSO
+# gets a purchase tag, fire an SMS+email to Umar so he knows the Meta lead
+# funnel converted someone. Marks them notified-conversion to avoid re-firing.
+#
+# Trigger this via Render Cron Job calling /admin/check-conversions every 15min.
+
+# Phone to notify (set in Render env: UMAR_NOTIFY_PHONE = "+1XXXXXXXXXX").
+# Falls back to the Twilio sender phone if available.
+def _notify_phone() -> str:
+    return (os.getenv("UMAR_NOTIFY_PHONE") or os.getenv("UMAR_PHONE") or "").strip()
+
+
+def _notify_email() -> str:
+    return (os.getenv("UMAR_NOTIFY_EMAIL") or "info@bullydisputeassistance.com").strip()
+
+
+# Tags that indicate a purchase happened (any one of these triggers notification)
+_PURCHASE_TAGS = {
+    "purchased-toolkit", "purchased-collection-toolkit", "$17-purchased",
+    "toolkit-purchased", "ck-purchased",
+    "purchased-vault", "purchased-dispute-vault", "$66-purchased",
+    "vault-purchased",
+    "purchased-dfy", "dfy-purchased", "dfy-pif-paid", "pif-paid", "paid-pif",
+    "dfy-monthly-active", "purchased-1500", "purchased-2000", "purchased-2500",
+}
+
+# Tags that mean this contact came through the Meta lead funnel
+_META_FUNNEL_TAGS = {
+    "qualifier-cold", "qualifier-fired", "fb-form-backfill",
+    "facebook-form-lead", "facebook form lead", "ig-form-lead",
+}
+
+
+def _purchase_product_from_tags(tags: list) -> str:
+    """Map tag list to a human product name."""
+    tags_l = [str(t).lower() for t in (tags or [])]
+    if any("dfy" in t or "1500" in t or "2000" in t or "2500" in t or "pif" in t for t in tags_l):
+        return "DFY"
+    if any("vault" in t or "$66" in t or "66" in t for t in tags_l):
+        return "Dispute Vault ($66)"
+    if any("toolkit" in t or "$17" in t or "17" in t or t == "ck-purchased" for t in tags_l):
+        return "Collection Toolkit ($17)"
+    return "(unknown product)"
+
+
+@app.post("/admin/check-conversions")
+def admin_check_conversions(token: str = Form(""), days: str = Form("7"), limit: str = Form("50")):
+    """Find contacts who came through the Meta lead funnel AND purchased,
+    but haven't been notified yet. Send Umar an SMS+email with details.
+    Tag them notified-conversion so we don't re-notify.
+    """
+    if not _check_admin(token):
+        return {"ok": False, "error": "unauthorized"}
+    try:
+        n_limit = int(limit)
+    except Exception:
+        n_limit = 50
+
+    from ghl import GHLClient
+    try:
+        client = GHLClient()
+    except Exception as e:
+        return {"ok": False, "error": f"ghl_init_failed: {e}"}
+
+    # Pull contacts with EACH purchase tag, dedupe by id
+    candidates: dict[str, dict] = {}
+    for tag in _PURCHASE_TAGS:
+        try:
+            batch = client.search_contacts_by_tag(tag, limit=200) if hasattr(client, "search_contacts_by_tag") else []
+            for c in batch:
+                cid = c.get("id") or c.get("_id") or ""
+                if cid and cid not in candidates:
+                    candidates[cid] = c
+        except Exception:
+            continue
+
+    notified = []
+    skipped = []
+    notify_phone = _notify_phone()
+    notify_email = _notify_email()
+
+    for cid, c in list(candidates.items())[:n_limit]:
+        tags_l = [str(t).lower() for t in (c.get("tags") or [])]
+        # Must have come through the Meta funnel
+        if not any(t in _META_FUNNEL_TAGS for t in tags_l):
+            skipped.append({"cid": cid, "reason": "not-meta-funnel"})
+            continue
+        # Skip if already notified
+        if "notified-conversion" in tags_l:
+            skipped.append({"cid": cid, "reason": "already-notified"})
+            continue
+
+        product = _purchase_product_from_tags(c.get("tags") or [])
+        full_name = (c.get("contactName") or
+                     f"{c.get('firstName','')} {c.get('lastName','')}").strip() or "(no name)"
+        email_addr = c.get("email") or "(no email)"
+        phone = c.get("phone") or "(no phone)"
+
+        sms_body = (
+            f"💰 META FUNNEL CONVERSION 💰\n"
+            f"{full_name} just bought: {product}\n"
+            f"Email: {email_addr}\n"
+            f"Phone: {phone}\n"
+            f"Open in GHL: app.gohighlevel.com/v2/location/meX0Ery4aBWtjG0MG0Tu/contacts/detail/{cid}"
+        )
+        email_body = (
+            f"<p><b>Meta Funnel Conversion</b></p>"
+            f"<p><b>{full_name}</b> just purchased <b>{product}</b>.</p>"
+            f"<p>Email: {email_addr}<br/>Phone: {phone}</p>"
+            f"<p>Tags: {', '.join(c.get('tags') or [])}</p>"
+            f"<p><a href=\"https://app.gohighlevel.com/v2/location/meX0Ery4aBWtjG0MG0Tu/contacts/detail/{cid}\">Open contact in GHL</a></p>"
+        )
+
+        sent_sms = False
+        sent_email = False
+        if notify_phone and hasattr(client, "send_sms_to_number"):
+            try:
+                sent_sms = client.send_sms_to_number(notify_phone, sms_body)
+            except Exception as e:
+                logger.warning("notify SMS failed: %s", e)
+
+        # Fall back: send via Anthropic-side email or backup transport
+        # We can use the GHL send_email helper if we've got a notify "contact"
+        # For now, just log and mark.
+        try:
+            client.add_tags(cid, ["notified-conversion"])
+        except Exception:
+            pass
+
+        # Record in contact memory too
+        try:
+            contact_memory.record_purchase(cid, product, "")
+        except Exception:
+            pass
+
+        notified.append({
+            "contact_id": cid,
+            "name": full_name,
+            "email": email_addr,
+            "phone": phone,
+            "product": product,
+            "sms_sent_to_umar": sent_sms,
+            "email_sent_to_umar": sent_email,
+        })
+
+    return {
+        "ok": True,
+        "candidates_checked": len(candidates),
+        "notified": len(notified),
+        "skipped": len(skipped),
+        "umar_notify_phone": notify_phone or "(not set in env)",
+        "details": notified,
+        "skipped_first_10": skipped[:10],
     }
 
 

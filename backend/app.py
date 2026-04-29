@@ -2584,6 +2584,105 @@ def admin_fire_qualifier(
     return {"ok": True, **result, "contact_id": contact_id, "first_name": fn}
 
 
+@app.post("/webhooks/ghl/contact-created")
+async def ghl_contact_created(request: Request):
+    """REAL-TIME LEAD TOUCH — fires qualifier SMS+Email within seconds of a
+    new IG/FB lead landing in GHL.
+
+    Accepts a flexible GHL webhook payload (most workflow webhooks send the
+    contact JSON directly, or wrap it under 'contact'). Looks up the contact_id,
+    then fires the qualifier first-touch sequence (same path the cron uses,
+    but for ONE specific contact instead of polling).
+
+    Wire this up in GHL:
+      1. Workflows → New workflow
+      2. Trigger: Contact Created (optionally filter source contains
+         'facebook' / 'instagram' or has tag 'Facebook form lead')
+      3. Action: Webhook → POST → https://bureau-bullies.onrender.com/webhooks/ghl/contact-created
+         Body: pass full Contact (default) — we'll figure out the contact_id.
+      4. Save & publish.
+
+    Idempotent: if the contact already has qualifier-fired or any purchase
+    tag, we skip (so an accidental re-trigger doesn't re-spam).
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    # GHL workflow webhooks can ship the contact in many shapes. Try the
+    # common ones in order.
+    contact = (
+        payload.get("contact")
+        or payload.get("Contact")
+        or payload  # fall back to top-level
+    )
+    if not isinstance(contact, dict):
+        return {"ok": False, "error": "invalid payload — no contact found"}
+
+    cid = (contact.get("id") or contact.get("contactId") or contact.get("contact_id")
+           or contact.get("_id") or "")
+    if not cid:
+        return {"ok": False, "error": "missing contact_id in payload"}
+
+    fn = (contact.get("firstName") or contact.get("first_name")
+          or contact.get("contact_first_name") or "there")
+    email = (contact.get("email") or contact.get("emailAddress")
+             or contact.get("contact_email") or "")
+    phone = (contact.get("phone") or contact.get("contact_phone") or "")
+
+    # Skip if already touched or already purchased — protects against
+    # accidental workflow re-triggers + double-fires.
+    tags_lower = [str(t).lower() for t in (contact.get("tags") or [])]
+    SKIP = {
+        "qualifier-cold", "qualifier-fired", "bureau-scan", "bureau-scan-completed",
+        "pause-ai", "manual-mode", "unsubscribed", "do-not-contact",
+        "purchased-toolkit", "purchased-vault", "purchased-dfy",
+        "toolkit-purchased", "vault-purchased", "dfy-purchased",
+        "paid-pif", "dfy-monthly-active", "notified-conversion",
+    }
+    if any(t in SKIP for t in tags_lower):
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "contact already in qualifier flow or purchased",
+            "contact_id": cid,
+            "matched_tags": [t for t in tags_lower if t in SKIP],
+        }
+
+    from ghl import GHLClient
+    try:
+        client = GHLClient()
+    except Exception as e:
+        return {"ok": False, "error": f"ghl_init_failed: {e}", "contact_id": cid}
+
+    # Tag first so we don't double-process if GHL re-fires the webhook
+    try:
+        client.add_tags(cid, ["qualifier-cold", "qualifier-fired"])
+    except Exception as e:
+        logger.warning("contact-created webhook: add_tags failed for %s: %s", cid, e)
+
+    # Fire qualifier — same code path as the cron. Synchronous so we can
+    # report the outcome back to the GHL workflow.
+    try:
+        result = _send_qualifier_first_touch(client, cid, fn, email, phone)
+    except Exception as e:
+        logger.exception("contact-created webhook: qualifier touch failed for %s", cid)
+        return {"ok": False, "error": str(e)[:500], "contact_id": cid}
+
+    logger.info(
+        "contact-created webhook: %s (cid=%s) sms=%s email=%s",
+        fn, cid, result.get("sms_ok"), result.get("email_ok"),
+    )
+    return {
+        "ok": True,
+        "contact_id": cid,
+        "first_name": fn,
+        "tagged": True,
+        **result,
+    }
+
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True}

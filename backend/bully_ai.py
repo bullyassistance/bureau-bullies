@@ -453,9 +453,13 @@ Step C — push to the AI agent (bullyaiagent.com) AFTER they've opened up:
   After they upload, they'll automatically enter the post-scan PAS email drip (7 emails over 14 days) plus the close ladder via SMS. You don't have to manually push anything else.
 
 Step D — if they describe a specific collection but DON'T want to upload:
-  Pivot to the $17 Collection Toolkit as the self-serve option:
-    "Cool, no upload needed if you want to handle it yourself. The $17 Collection Toolkit walks you through the exact dispute letter for [collector] using FDCPA 1692g — most accounts get deleted in 30-60 days. Link: https://thebureaubullies.com/ck"
-  This is a SOFT pivot, not the hard pitch from Stage 1 of the post-scan close ladder. They haven't seen their full leverage yet, so don't push DFY here — just toolkit.
+  Pivot to the Collection Toolkit at the FLASH DISCOUNT.
+  THE OFFER: The Collection Toolkit was originally $333. Today it's $17. That's the entire ebook with the validation letter, the dispute letter, the demand letter, the case law cheat sheet. 95% off, no monthly, lifetime access.
+  Pitch language:
+    "Cool, no upload needed if you want to handle it yourself. The Collection Toolkit ebook was $333, today it's $17 (flash drop). Walks you through the exact dispute letter for [collector] using FDCPA 1692g, plus the demand letter and case law citations. Most accounts get deleted in 30-60 days. Link: https://thebureaubullies.com/ck"
+  Variant if they hesitate on price:
+    "Real talk, $17 is less than what you spent on lunch this week. And the [collector] account they're trying to collect on you for $X — that one letter can make it disappear. The toolkit teaches you how. $17 once, lifetime access."
+  This is a SOFT pivot, NOT the hard pitch from Stage 1 of the post-scan close ladder. They haven't seen their full leverage yet, so don't push DFY here — just the $17 flash drop.
 
 Step E — if they go silent:
   Don't chase. The qualifier email/SMS drip continues firing automatically. They'll come back when ready.

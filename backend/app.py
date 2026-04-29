@@ -2242,11 +2242,12 @@ def _send_qualifier_first_touch(client, contact_id: str, fn: str, email: str, ph
     result = {"sms_ok": False, "email_ok": False, "errors": []}
     fn_safe = (fn or "there").strip()
 
-    # SMS #1 — only if we have a phone number
+    # SMS #1 — only if we have a phone number.
+    # GHLClient.send_sms takes (phone, message) — not contact_id.
     if phone:
         try:
             sms_body = _QUALIFIER_SMS_1.format(fn=fn_safe)
-            ok = client.send_sms(contact_id=contact_id, message=sms_body) if hasattr(client, "send_sms") else False
+            ok = client.send_sms(phone, sms_body) if hasattr(client, "send_sms") else False
             result["sms_ok"] = bool(ok)
         except Exception as e:
             result["errors"].append(f"sms: {e}")
@@ -2475,7 +2476,7 @@ def admin_check_non_uploaders(
                 try:
                     body = _NON_UPLOADER_SMS.format(fn=fn)
                     if hasattr(client, "send_sms"):
-                        ok = client.send_sms(contact_id=cid, message=body)
+                        ok = client.send_sms(phone, body)
                         if ok:
                             sms_sent += 1
                 except Exception as se:

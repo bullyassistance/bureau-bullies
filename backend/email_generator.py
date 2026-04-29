@@ -350,6 +350,13 @@ def generate_full_sequence(
 
     Returns a list of 7 dicts: [{"day": 0, "subject": "...", "body": "..."}, ...]
     """
+    # Lazy-import the case studies module so failures here don't break the drip
+    try:
+        from case_studies import format_for_email as _case_study_block
+    except Exception as _e:
+        logger.warning("case_studies module unavailable: %s — drip will run without proof", _e)
+        _case_study_block = lambda i: ""  # noqa: E731
+
     out = []
     for i, step in enumerate(SEQUENCE):
         try:
@@ -361,27 +368,31 @@ def generate_full_sequence(
                 goal_label=goal_label,
                 api_key=api_key,
             )
+            # Append a real-customer-win P.S. block for social proof.
+            # Rotates Idris / Bryan / Delores across the 7 emails.
+            body_with_proof = email["body"] + _case_study_block(i + 1)
             out.append({
                 "day": step["day"],
                 "subject": email["subject"],
-                "body": email["body"],
+                "body": body_with_proof,
             })
             logger.info("Email %d/7 generated (day %d): %r", i + 1, step["day"], email["subject"][:60])
         except Exception as e:
             logger.exception("Failed to generate email %d: %s", i, e)
             # Fallback so the drip always has 7 entries
+            fallback_body = (
+                f"Hi {consumer_first},\n\n"
+                f"Following up on the report scan I ran for you. "
+                f"I found {scan.get('violations_count', 0)} violations worth about "
+                f"${scan.get('total_leverage', 0):.0f} in leverage — which means real "
+                f"negotiating power against {scan.get('top_collection_name', 'these collectors')}.\n\n"
+                f"Want me to walk you through how to use it? Reply YES.\n\n"
+                "— Bully AI"
+            ) + _case_study_block(i + 1)
             out.append({
                 "day": step["day"],
                 "subject": f"{consumer_first} — quick follow-up on your scan",
-                "body": (
-                    f"Hi {consumer_first},\n\n"
-                    f"Following up on the report scan I ran for you. "
-                    f"I found {scan.get('violations_count', 0)} violations worth about "
-                    f"${scan.get('total_leverage', 0):.0f} in leverage — which means real "
-                    f"negotiating power against {scan.get('top_collection_name', 'these collectors')}.\n\n"
-                    f"Want me to walk you through how to use it? Reply YES.\n\n"
-                    "— Bully AI"
-                ),
+                "body": fallback_body,
             })
     return out
 

@@ -180,6 +180,11 @@ async def scan(
         custom_fields["cr_goal"] = goal_key
         custom_fields["cr_goal_label"] = goal_label
 
+        # Write the actual scan timestamp so the email scheduler's catch-up
+        # logic uses TODAY's scan, not GHL's old dateAdded if this contact
+        # had a prior interaction. Critical for the "skipped-too-old" bug.
+        custom_fields["cr_scan_completed_at"] = datetime.now(timezone.utc).isoformat()
+
         # Capture IG handle if provided so we can DM them the breakdown.
         # Strip leading @ and any URL prefix so the bare handle is stored.
         ig_clean = (ig_handle or "").strip().lstrip("@").strip()
@@ -1371,6 +1376,93 @@ def admin_dispatch_next(token: str = Form(""), regenerate: str = Form("1"), limi
         "sequence_complete": sequence_complete,
         "total_contacts_seen": len(contacts) if contacts else 0,
         "regenerated": regenerate == "1",
+    }
+
+
+@app.post("/admin/reschedule-contact")
+def admin_reschedule_contact(token: str = Form(""), email: str = Form("")):
+    """Force-rebuild a single contact's email queue using NOW as scan time.
+    Use to recover a contact whose queue got stuck on stale dateAdded timestamps
+    causing all rows to be flagged 'skipped-too-old'.
+
+    Cancels any existing rows for the contact, then re-queues all 7 emails fresh.
+    """
+    if not _check_admin(token):
+        return {"ok": False, "error": "unauthorized"}
+    email_lc = (email or "").strip().lower()
+    if not email_lc:
+        return {"ok": False, "error": "pass email="}
+
+    from ghl import GHLClient
+    try:
+        client = GHLClient()
+    except Exception as e:
+        return {"ok": False, "error": f"ghl_init_failed: {e}"}
+
+    # Find the contact
+    contact = None
+    if hasattr(client, "search_contact_by_email"):
+        try:
+            contact = client.search_contact_by_email(email_lc)
+        except Exception as e:
+            return {"ok": False, "error": f"lookup_failed: {e}"}
+    if not contact:
+        return {"ok": False, "error": "contact_not_found", "email": email_lc}
+
+    cid = contact.get("id") or contact.get("_id") or ""
+    if not cid:
+        return {"ok": False, "error": "no_contact_id"}
+    fn = contact.get("firstName") or contact.get("first_name") or ""
+
+    # Build id-to-key reverse map for custom fields
+    id_to_key = {}
+    try:
+        for f in client.list_custom_fields():
+            fid = f.get("id") or f.get("_id")
+            fkey = (f.get("fieldKey") or f.get("name") or "").replace("contact.", "")
+            if fid and fkey:
+                id_to_key[fid] = fkey
+    except Exception:
+        pass
+
+    # Resolve email subject/body fields
+    cf = contact.get("customFields") or contact.get("custom_field") or []
+    cf_map = {}
+    for item in cf:
+        fid = item.get("id") or item.get("_id") or item.get("customFieldId") or ""
+        k = (item.get("fieldKey") or item.get("key") or item.get("name") or "").replace("contact.", "")
+        if not k and fid in id_to_key:
+            k = id_to_key[fid]
+        v = item.get("value") or item.get("field_value") or item.get("fieldValue") or ""
+        if k:
+            cf_map[k] = v
+
+    emails = []
+    for i in range(1, 8):
+        subj = cf_map.get(f"cr_email_{i}_subject", "")
+        body = cf_map.get(f"cr_email_{i}_body", "")
+        if subj and body:
+            emails.append({"day": [0, 1, 3, 5, 7, 10, 14][i - 1], "subject": subj, "body": body})
+
+    if not emails:
+        return {"ok": False, "error": "no_email_fields_on_contact", "contact_id": cid}
+
+    # Cancel any existing rows
+    try:
+        cancel_drip(cid, reason="reschedule-replace")
+    except Exception:
+        pass
+
+    # Re-queue using NOW as scan_time so all 7 emails get future-dated cadence
+    n = schedule_email_drip(cid, email_lc, fn, emails, scan_time=datetime.now(timezone.utc))
+
+    return {
+        "ok": True,
+        "contact_id": cid,
+        "first_name": fn,
+        "emails_rescheduled": n,
+        "scan_time": "now",
+        "next_email_in": "~2 minutes (email 1)",
     }
 
 

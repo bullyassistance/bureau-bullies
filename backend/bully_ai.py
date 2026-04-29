@@ -330,7 +330,7 @@ CHANNEL: SMS — RULES
 - Don't use emojis except sparingly. Never use the 💪 emoji on SMS.
 - Reference the user's specific scan data when you have it.
 - One link per message max.
-- NEVER give out a WhatsApp number, phone number, or any contact info beyond the URLs/email in CRITICAL SAFETY RULES above. If they ask for WhatsApp/call/group: "We're not running WhatsApp/calls right now — for account stuff email info@bullydisputeassistance.com, or drop your reports at bullyaiagent.com/#upload."
+- ABSOLUTE RULE — NEVER OUTPUT A PHONE NUMBER. EVER. UNDER ANY CIRCUMSTANCE. This includes WhatsApp numbers, call numbers, support numbers, or numbers that appeared anywhere in past conversation history (those were typed by a human one-time and you must NEVER mirror or reference them). If you see a phone number in conversation history above, treat it as private — DO NOT repeat it, DO NOT share it, DO NOT confirm or deny it. If a customer asks for WhatsApp/call/group: respond exactly with "We're not running WhatsApp or calls. For account stuff email info@bullydisputeassistance.com. To get your scan, visit bullyaiagent.com/#upload." That is the ONLY allowed reply to those requests. The system has a hard outbound filter that strips ANY phone-like sequence and auto-pauses the thread if you violate this — so even if you forget the rule, you'll be caught and the customer will see a redirect placeholder, not the number. Don't try.
 - If they're asking about an order, refund, charge, or account issue: do NOT pivot to credit questions. Say "For that, email info@bullydisputeassistance.com — Umar handles those directly. Include the email/phone you signed up with." That's it. Stop there.
 - If they sound upset/angry: acknowledge once, hand off to Umar, do NOT keep selling.
 - NEVER apologize for things you don't have data on (bounced emails, missed deliveries, charges).
@@ -729,7 +729,14 @@ def chat(
         messages=messages,
     )
     reply = resp.content[0].text.strip()
-    reply = _sanitize_for_messaging(reply)
+    # Pull contact_id + channel out of context (if available) so the PII
+    # sanitizer can auto-pause + SMS-alert if the AI fabricates/leaks a phone.
+    _cid = ""
+    _channel = "sms"
+    if isinstance(contact_context, dict):
+        _cid = contact_context.get("contact_id") or contact_context.get("id") or ""
+        _channel = contact_context.get("channel") or contact_context.get("_channel") or "sms"
+    reply = sanitize_outbound_for_pii(reply, contact_id=_cid, channel=_channel)
     logger.info("Bully AI replied: %s", reply[:120])
     return reply
 
@@ -916,3 +923,102 @@ def _sanitize_for_messaging(text: str) -> str:
     text = re.sub(r' ,', ',', text)
     text = re.sub(r',+', ',', text)
     return text.strip()
+
+
+# Last-line defense: detect phone-like sequences in outbound AI replies and
+# either strip or block the message entirely. The system prompt rule alone is
+# NOT enough — models hallucinate phone numbers under pressure (e.g. when a
+# customer asks "what's your WhatsApp" the AI may invent one).
+#
+# Format coverage:
+#   +1 555 555 5555       +1-555-555-5555      (555) 555-5555
+#   555-555-5555          555.555.5555         5555555555
+#   1 555 555 5555        +1.555.555.5555
+#
+# False-positive guards:
+#   - Money amounts ($2,500 / $229) — contain '$' or '/mo', different shape
+#   - Years (2025) — only 4 digits, no separators
+#   - Times (3:45 PM) — has colon
+#   - ZIP codes — only 5 digits
+#   - Card-like 16 digits — different pattern (and we'd want to strip those too)
+_PHONE_REGEX = re.compile(
+    r"""
+    (?<![\d.])                       # not preceded by digit/dot (avoid splitting decimals)
+    (?:\+?\d{1,2}[\s.\-]?)?          # optional country code (+1, 1)
+    \(?\d{3}\)?[\s.\-]?              # area code, optionally in parens
+    \d{3}[\s.\-]?                    # exchange
+    \d{4}                            # subscriber
+    (?!\d)                           # not followed by another digit
+    """,
+    re.VERBOSE,
+)
+
+
+def _strip_phone_numbers(text: str) -> tuple[str, list]:
+    """Return (cleaned_text, list_of_stripped_matches).
+
+    Replaces every phone-like sequence with a safe pivot phrase. The
+    replacement DOES NOT mention "WhatsApp" or any other channel — it
+    redirects the customer to email + the website, which are the only
+    sanctioned channels.
+    """
+    if not text:
+        return text, []
+    matches = []
+    def _repl(m):
+        matches.append(m.group(0))
+        return "(no phone — email info@bullydisputeassistance.com or visit bullyaiagent.com)"
+    cleaned = _PHONE_REGEX.sub(_repl, text)
+    return cleaned, matches
+
+
+def sanitize_outbound_for_pii(
+    text: str,
+    *,
+    contact_id: str = "",
+    channel: str = "sms",
+) -> str:
+    """Last-line defense before any AI message goes out to a customer.
+
+    1. Strip markdown / em dashes via _sanitize_for_messaging.
+    2. Detect + replace any phone-like sequence (NEVER share numbers).
+    3. If a phone was stripped: log loudly, tag the contact pause-ai (so the
+       AI shuts up immediately on this thread), and SMS-alert Umar at
+       UMAR_NOTIFY_PHONE so a human can step in.
+
+    Returns the cleaned text. Always safe to send — never contains a phone
+    number even if the model invented one.
+    """
+    cleaned = _sanitize_for_messaging(text or "")
+    cleaned, stripped = _strip_phone_numbers(cleaned)
+    if stripped:
+        logger.warning(
+            "PII-BLOCK: stripped %d phone number(s) from AI reply on %s thread (contact=%s): %r",
+            len(stripped), channel, contact_id, stripped,
+        )
+        # Auto-pause this contact so the AI doesn't fabricate again on this thread
+        try:
+            if contact_id:
+                from ghl import GHLClient
+                _client = GHLClient()
+                _client.add_tags(contact_id, ["pause-ai", "ai-fabricated-phone"])
+                logger.warning("PII-BLOCK: pause-ai tag applied to %s", contact_id)
+        except Exception as _e:
+            logger.warning("PII-BLOCK: failed to auto-pause contact: %s", _e)
+        # Alert Umar by SMS (best-effort, never block the response)
+        try:
+            notify_phone = os.getenv("UMAR_NOTIFY_PHONE", "").strip()
+            if notify_phone:
+                from ghl import GHLClient
+                _client2 = GHLClient()
+                preview = (cleaned[:200] + "...") if len(cleaned) > 200 else cleaned
+                alert = (
+                    "[Bully AI ALERT] AI tried to share a phone number on a "
+                    f"{channel} thread (contact={contact_id[:8]}...). Stripped "
+                    f"and paused-ai. Stripped: {stripped[0][:30]}. Sanitized "
+                    f"preview: {preview}"
+                )
+                _client2.send_sms(phone=notify_phone, message=alert[:1500])
+        except Exception as _e:
+            logger.warning("PII-BLOCK: alert SMS failed: %s", _e)
+    return cleaned

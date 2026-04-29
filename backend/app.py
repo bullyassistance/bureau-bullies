@@ -1634,6 +1634,136 @@ def admin_check_conversions(
     }
 
 
+@app.post("/admin/ab-stats")
+def admin_ab_stats(token: str = Form("")):
+    """A/B/C variant attribution. For each variant, count:
+       - touched: how many got that variant's opener
+       - replied: how many replied (proxied via 'qualified' tag — they at least
+         engaged enough that detect_qualification_signals flagged them)
+       - bought: how many also have a purchase tag
+
+    Returns conversion rate per variant so you can pick the winner.
+    """
+    if not _check_admin(token):
+        return {"ok": False, "error": "unauthorized"}
+
+    from ghl import GHLClient
+    try:
+        client = GHLClient()
+    except Exception as e:
+        return {"ok": False, "error": f"ghl_init_failed: {e}"}
+
+    def _ids(tag: str) -> set:
+        try:
+            batch = client.search_contacts_by_tag(tag, limit=500) if hasattr(client, "search_contacts_by_tag") else []
+            return {(c.get("id") or c.get("_id") or "") for c in batch if (c.get("id") or c.get("_id"))}
+        except Exception:
+            return set()
+
+    qualified = _ids("qualified")
+    purchasers = _ids("tripwire_buyer") | _ids("dispute vault")
+    for t in ("dfy buyer", "purchased-dfy", "paid-pif", "dfy-monthly-active",
+              "purchased-2500", "purchased-2000", "purchased-1500"):
+        purchasers |= _ids(t)
+
+    out = {}
+    for v in ("A", "B", "C"):
+        touched = _ids(f"variant-{v}")
+        replied = touched & qualified
+        bought = touched & purchasers
+        out[v] = {
+            "touched": len(touched),
+            "replied": len(replied),
+            "bought": len(bought),
+            "reply_rate_pct": round(100.0 * len(replied) / max(1, len(touched)), 2),
+            "conversion_rate_pct": round(100.0 * len(bought) / max(1, len(touched)), 2),
+        }
+    return {"ok": True, "variants": out}
+
+
+@app.post("/admin/hot-leads")
+def admin_hot_leads(token: str = Form(""), limit: str = Form("5")):
+    """Surface the top N hottest leads Umar should personally text RIGHT NOW.
+
+    Scoring (higher = hotter):
+      +5 if has 'heat-critical' tag
+      +3 if has 'heat-hot' tag
+      +3 if has 'qualified' tag (replied to qualifier and named a debt/goal)
+      +4 if has 'planned-tier-dfy' tag (system flagged them as DFY candidate)
+      +2 if has 'tripwire_buyer' (already a customer — easy upsell)
+      +2 if has 'bureau-scan' (uploaded a report)
+      -10 if already bought DFY (stop pitching)
+      -10 if has pause-ai or do-not-contact tag
+    Filters out:
+      - notified-conversion (already personally followed up)
+      - qualifier-cold without any reply signal (still cold)
+    Returns: name, phone, email, score, top tag, recent context.
+    """
+    if not _check_admin(token):
+        return {"ok": False, "error": "unauthorized"}
+    try:
+        n = int(limit)
+    except Exception:
+        n = 5
+
+    from ghl import GHLClient
+    try:
+        client = GHLClient()
+    except Exception as e:
+        return {"ok": False, "error": f"ghl_init_failed: {e}"}
+
+    # Pull from heat-tagged + qualified pools (most relevant)
+    pool = {}
+    for tag in ("heat-critical", "heat-hot", "qualified", "planned-tier-dfy",
+                "bureau-scan", "tripwire_buyer", "dispute vault"):
+        try:
+            batch = client.search_contacts_by_tag(tag, limit=200) if hasattr(client, "search_contacts_by_tag") else []
+            for c in batch:
+                cid = c.get("id") or c.get("_id") or ""
+                if cid and cid not in pool:
+                    pool[cid] = c
+        except Exception:
+            continue
+
+    scored = []
+    SKIP = {"do-not-contact", "unsubscribed", "pause-ai", "notified-conversion",
+            "manual-mode", "ai-fabricated-phone"}
+    BOUGHT_DFY = {"dfy buyer", "purchased-dfy", "paid-pif", "dfy-monthly-active",
+                  "purchased-2500", "purchased-2000", "purchased-1500"}
+
+    for cid, c in pool.items():
+        tags_l = [str(t).lower() for t in (c.get("tags") or [])]
+        if any(t in SKIP for t in tags_l):
+            continue
+        if any(t in BOUGHT_DFY for t in tags_l):
+            continue  # already bought top tier
+        score = 0
+        if "heat-critical" in tags_l: score += 5
+        if "heat-hot" in tags_l: score += 3
+        if "qualified" in tags_l: score += 3
+        if "planned-tier-dfy" in tags_l: score += 4
+        if "tripwire_buyer" in tags_l: score += 2
+        if "bureau-scan" in tags_l: score += 2
+        if score < 3:
+            continue  # too cold to surface
+        full_name = (c.get("contactName") or
+                     f"{c.get('firstName','')} {c.get('lastName','')}").strip()
+        scored.append({
+            "score": score,
+            "contact_id": cid,
+            "name": full_name or "(no name)",
+            "phone": c.get("phone") or "",
+            "email": c.get("email") or "",
+            "top_tags": [t for t in (c.get("tags") or []) if str(t).lower() in
+                         ("heat-critical", "heat-hot", "qualified",
+                          "planned-tier-dfy", "tripwire_buyer", "dispute vault",
+                          "bureau-scan")][:5],
+            "ghl_url": f"https://app.gohighlevel.com/v2/location/meX0Ery4aBWtjG0MG0Tu/contacts/detail/{cid}",
+        })
+    scored.sort(key=lambda x: -x["score"])
+    return {"ok": True, "count": len(scored[:n]), "leads": scored[:n]}
+
+
 @app.post("/admin/funnel-stats")
 def admin_funnel_stats(token: str = Form("")):
     """Read-only funnel snapshot — counts contacts at each stage so we can
@@ -2398,11 +2528,46 @@ def admin_scheduler_status(token: str = ""):
 # same CSV is safe. We track per-contact "qualifier-fired-at" custom field
 # to avoid re-firing SMS #1 on the same lead.
 
-_QUALIFIER_SMS_1 = (
-    "Hey {fn}, Umar here from Bureau Bullies. Real quick before I dive in, "
-    "what's been weighing on you most about your credit right now? Just want "
-    "to know how to actually help."
-)
+# A/B/C VARIANTS — assigned by contact_id hash so the same lead always gets
+# the same opener. Track via the tag `variant-A` / `variant-B` / `variant-C`
+# on the contact, then run /admin/ab-stats to see which converts best.
+_QUALIFIER_SMS_VARIANTS = {
+    # A — empathy-first (the current/control). Builds rapport, opens conversation.
+    "A": (
+        "Hey {fn}, Umar here from Bureau Bullies. Real quick before I dive in, "
+        "what's been weighing on you most about your credit right now? Just want "
+        "to know how to actually help."
+    ),
+    # B — direct/specific. Asks for a number to anchor the conversation in
+    # concrete data, which usually gets faster + more useful replies.
+    "B": (
+        "Hey {fn}, Umar from Bureau Bullies. Quick one: roughly how many "
+        "collections or charge-offs are showing on your report right now? "
+        "Even rough is fine. I'll tell you what to do based on that number."
+    ),
+    # C — transformation/value-first. Leads with what they get if they engage.
+    "C": (
+        "Hey {fn}, Umar from Bureau Bullies. I scan credit reports and find "
+        "every FCRA violation in 90 sec, free. Want me to run yours? Tells "
+        "you exactly which accounts can be deleted vs. settled. Reply YES."
+    ),
+}
+
+# Backwards compatibility — anything still referencing the old name uses A
+_QUALIFIER_SMS_1 = _QUALIFIER_SMS_VARIANTS["A"]
+
+
+def _pick_qualifier_variant(contact_id: str) -> str:
+    """Deterministic A/B/C assignment by contact_id. Same contact = same variant
+    every time (so re-fires don't change their experience). Even split.
+    """
+    if not contact_id:
+        return "A"
+    # Stable hash of the contact_id, modulo 3
+    h = 0
+    for ch in str(contact_id):
+        h = (h * 31 + ord(ch)) & 0xFFFFFFFF
+    return ["A", "B", "C"][h % 3]
 
 _QUALIFIER_EMAIL_1_SUBJECT = "{fn}, real quick before I help"
 _QUALIFIER_EMAIL_1_BODY = (
@@ -2472,13 +2637,25 @@ def _send_qualifier_first_touch(client, contact_id: str, fn: str, email: str, ph
 
     Returns a dict with sms_ok / email_ok flags so the caller can audit.
     """
-    result = {"sms_ok": False, "email_ok": False, "errors": []}
+    result = {"sms_ok": False, "email_ok": False, "errors": [], "variant": ""}
     fn_safe = (fn or "there").strip()
+
+    # Assign A/B/C variant by contact_id hash (deterministic — same lead always
+    # sees the same opener). Tag the contact so /admin/ab-stats can attribute
+    # conversions back to the variant.
+    variant = _pick_qualifier_variant(contact_id)
+    result["variant"] = variant
+    template = _QUALIFIER_SMS_VARIANTS.get(variant, _QUALIFIER_SMS_VARIANTS["A"])
+    if contact_id:
+        try:
+            client.add_tags(contact_id, [f"variant-{variant}"])
+        except Exception as _e:
+            logger.warning("variant tag failed for %s: %s", contact_id, _e)
 
     # SMS #1 — try contact_id-routed first (GHL preferred), fall back to phone.
     if phone or contact_id:
         try:
-            sms_body = _QUALIFIER_SMS_1.format(fn=fn_safe)
+            sms_body = template.format(fn=fn_safe)
             ok = client.send_sms(phone=phone, message=sms_body, contact_id=contact_id) \
                  if hasattr(client, "send_sms") else False
             result["sms_ok"] = bool(ok)

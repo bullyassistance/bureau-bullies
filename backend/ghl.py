@@ -507,7 +507,10 @@ class GHLClient:
                 "this is umar", "umar here", "this is the real umar", "real umar speaking",
                 # Hand-off intent
                 "i'll take it from here", "i'll take over from here", "let me jump in", "taking over",
-                "ai off", "stop ai", "pause ai", "ai stop",
+                # Pause/stop signals — Umar types these to deliberately silence the AI
+                "ai off", "stop ai", "pause ai", "ai stop", "ai pause",
+                "bully pause", "bully off", "pause bully", "stop bully",
+                "pause", "bully ai pause", "bully ai off",
                 # Umar's actual voice patterns from production threads
                 "safe travels", "lmk when", "lmk when you're", "hit me up when",
                 "ill do it $", "i'll do it $", "old price", "doubled the work", "twice the work",

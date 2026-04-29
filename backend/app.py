@@ -1379,6 +1379,101 @@ def admin_dispatch_next(token: str = Form(""), regenerate: str = Form("1"), limi
     }
 
 
+@app.post("/admin/pause-contact")
+def admin_pause_contact(token: str = Form(""), query: str = Form("")):
+    """Apply pause-ai tag to a contact by partial-name/email/phone search.
+    Multiple queries can be passed comma-separated. Returns the matched
+    contacts and which got tagged.
+
+    Examples:
+      ?query=Pee Ditty
+      ?query=ebony,relaterealness,pee ditty
+      ?query=info@clarktextile.com
+    """
+    if not _check_admin(token):
+        return {"ok": False, "error": "unauthorized"}
+    if not query:
+        return {"ok": False, "error": "pass query="}
+
+    from ghl import GHLClient
+    try:
+        client = GHLClient()
+    except Exception as e:
+        return {"ok": False, "error": f"ghl_init_failed: {e}"}
+
+    queries = [q.strip() for q in query.split(",") if q.strip()]
+    results = []
+    for q in queries:
+        # Try email lookup first
+        contact = None
+        if "@" in q and hasattr(client, "search_contact_by_email"):
+            contact = client.search_contact_by_email(q)
+        # Fallback: search contacts list with query string
+        if not contact:
+            try:
+                import requests as _rq
+                from ghl import V2_BASE
+                r = _rq.post(
+                    f"{V2_BASE}/contacts/search",
+                    headers=client._headers,
+                    json={
+                        "locationId": client.location_id,
+                        "pageLimit": 5,
+                        "query": q,
+                    },
+                    timeout=15,
+                )
+                if r.ok:
+                    contacts = r.json().get("contacts", []) or []
+                    # Pick the first match that has a name containing the query (case-insensitive)
+                    q_lower = q.lower()
+                    for c in contacts:
+                        full = (c.get("contactName") or c.get("fullNameLowerCase") or
+                                f"{c.get('firstName','')} {c.get('lastName','')}").lower()
+                        if q_lower in full or q_lower in (c.get("email") or "").lower() \
+                                or q_lower in (c.get("phone") or "").lower():
+                            contact = c
+                            break
+                    if not contact and contacts:
+                        contact = contacts[0]
+            except Exception as e:
+                results.append({"query": q, "error": str(e)[:200]})
+                continue
+
+        if not contact:
+            results.append({"query": q, "matched": False, "error": "no contact found"})
+            continue
+
+        cid = contact.get("id") or contact.get("_id") or ""
+        full_name = contact.get("contactName") or f"{contact.get('firstName','')} {contact.get('lastName','')}".strip()
+        email_addr = contact.get("email") or ""
+        try:
+            client.add_tags(cid, ["pause-ai", "manual-mode"])
+            # Cancel any pending email drip rows for this contact too
+            from scheduler import cancel_drip
+            cancel_drip(cid, reason="paused-by-admin")
+            results.append({
+                "query": q,
+                "matched": True,
+                "contact_id": cid,
+                "name": full_name,
+                "email": email_addr,
+                "tagged": True,
+                "drip_cancelled": True,
+            })
+        except Exception as e:
+            results.append({
+                "query": q,
+                "matched": True,
+                "contact_id": cid,
+                "name": full_name,
+                "tagged": False,
+                "error": str(e)[:200],
+            })
+
+    return {"ok": True, "queries_processed": len(queries), "results": results}
+
+
 @app.post("/admin/reschedule-contact")
 def admin_reschedule_contact(token: str = Form(""), email: str = Form("")):
     """Force-rebuild a single contact's email queue using NOW as scan time.

@@ -495,7 +495,36 @@
   /* ------- Fade-in animations ------- */
   [data-reveal] { opacity: 0; transform: translateY(20px); transition: opacity .7s, transform .7s; }
   [data-reveal].in { opacity: 1; transform: translateY(0); }
+
+  /* ------- Social-proof video on results screen ------- */
+  .video-proof { margin: 20px 0 8px; border-radius: 14px; overflow: hidden;
+    background: #000; aspect-ratio: 16/9; max-width: 640px; width: 100%; }
+  .video-proof iframe, .video-proof video { width: 100%; height: 100%; border: 0; display: block; }
+  .video-proof-caption { font-size: 13px; color: var(--mute); text-align: center; margin: 6px 0 18px; }
 </style>
+
+<!-- Meta Pixel (replace YOUR_PIXEL_ID below with the real one from Meta Events Manager) -->
+<script>
+!function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?
+n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;
+n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;
+t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(window,
+document,'script','https://connect.facebook.net/en_US/fbevents.js');
+fbq('init', 'YOUR_PIXEL_ID');
+fbq('track', 'PageView');
+</script>
+<noscript><img height="1" width="1" style="display:none"
+src="https://www.facebook.com/tr?id=YOUR_PIXEL_ID&ev=PageView&noscript=1"/></noscript>
+
+<!-- Google Analytics 4 (replace G-XXXXXXXXXX with the real Measurement ID) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-XXXXXXXXXX"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+  gtag('config', 'G-XXXXXXXXXX');
+</script>
+
 </head>
 <body>
 
@@ -554,6 +583,22 @@
   <div class="hero-visual">
     <div class="orbit-ring"></div>
     <canvas id="three-canvas"></canvas>
+  </div>
+</section>
+
+<!-- SOCIAL PROOF VIDEO (Umar to camera, ~2 min) -->
+<!-- To swap the video, replace the YouTube URL below with your own video embed
+     URL, or replace the <iframe> with a <video src="..."> tag for a self-hosted file. -->
+<section style="display:flex;justify-content:center;padding:0 24px;margin-top:24px;">
+  <div style="max-width:640px;width:100%;" data-reveal>
+    <div class="video-proof">
+      <iframe src="https://www.youtube.com/embed/YOUR_VIDEO_ID?rel=0&modestbranding=1"
+              title="Why I built Bully AI" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+              allowfullscreen></iframe>
+    </div>
+    <div class="video-proof-caption">
+      Watch (90 sec): why I built Bully AI and exactly what it's going to find on your report.
+    </div>
   </div>
 </section>
 

@@ -1379,6 +1379,175 @@ def admin_dispatch_next(token: str = Form(""), regenerate: str = Form("1"), limi
     }
 
 
+@app.post("/admin/sync-fb-leads")
+def admin_sync_fb_leads(token: str = Form(""), limit: str = Form("50"), dry_run: str = Form("0")):
+    """THE FIX FOR THE 134 UNREAD LEADS PROBLEM.
+
+    Polls GHL for contacts whose source field contains 'facebook', 'instagram',
+    'fb form', 'ig form', or who have the 'Facebook form lead' tag. For each
+    that hasn't already been touched (no qualifier-cold, qualifier-fired, or
+    bureau-scan tag), this endpoint:
+
+      1. Tags them `qualifier-cold` and `qualifier-fired`
+      2. Fires SMS #1 + Email #1 of the qualifier sequence
+      3. Skips them on future runs (because of qualifier-fired tag)
+
+    This BYPASSES the broken GHL workflow trigger entirely. Every FB/IG form
+    submission that lands in GHL gets touched within `cron_interval` minutes.
+
+    Setup: schedule a Render Cron Job to call this every 15 minutes.
+
+    Args:
+      limit: max contacts to process per call (safety cap, default 50)
+      dry_run: if "1", returns the contacts that WOULD be synced without firing
+    """
+    if not _check_admin(token):
+        return {"ok": False, "error": "unauthorized"}
+    try:
+        max_n = int(limit)
+    except Exception:
+        max_n = 50
+    is_dry = dry_run == "1"
+
+    from ghl import GHLClient
+    try:
+        client = GHLClient()
+    except Exception as e:
+        return {"ok": False, "error": f"ghl_init_failed: {e}"}
+
+    # Pull all contacts (paginated). We'll filter in memory for FB/IG sources.
+    # If you have a "Facebook form lead" tag, this is faster — try that first.
+    candidates = []
+    try:
+        # Try by tag first (faster + more targeted)
+        for tag in ("Facebook form lead", "facebook-form-lead", "fb-form-lead",
+                    "ig-form-lead", "Instagram form lead"):
+            try:
+                tagged = client.search_contacts_by_tag(tag, limit=500)
+                if tagged:
+                    candidates.extend(tagged)
+                    logger.info("sync-fb-leads: %d candidates from tag '%s'", len(tagged), tag)
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning("sync-fb-leads tag search failed: %s", e)
+
+    # Also try source-field filter via GHL v2 search
+    try:
+        import requests as _rq
+        from ghl import V2_BASE
+        for source_query in ("facebook", "instagram", "fb form", "ig form"):
+            try:
+                r = _rq.post(
+                    f"{V2_BASE}/contacts/search",
+                    headers=client._headers,
+                    json={
+                        "locationId": client.location_id,
+                        "pageLimit": 100,
+                        "filters": [{"field": "source", "operator": "contains", "value": source_query}],
+                    },
+                    timeout=20,
+                )
+                if r.ok:
+                    batch = r.json().get("contacts", []) or []
+                    candidates.extend(batch)
+                    logger.info("sync-fb-leads: %d candidates from source='%s'", len(batch), source_query)
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning("sync-fb-leads source search failed: %s", e)
+
+    # Dedupe by contact_id
+    seen_ids = set()
+    unique = []
+    for c in candidates:
+        cid = c.get("id") or c.get("_id") or ""
+        if cid and cid not in seen_ids:
+            seen_ids.add(cid)
+            unique.append(c)
+    logger.info("sync-fb-leads: %d unique candidates after dedupe", len(unique))
+
+    # Filter out contacts already touched
+    SKIP_TAGS = {"qualifier-cold", "qualifier-fired", "bureau-scan",
+                 "bureau-scan-completed", "pause-ai", "manual-mode",
+                 "unsubscribed", "do-not-contact", "qualified"}
+
+    eligible = []
+    for c in unique:
+        tags_lower = [str(t).lower() for t in (c.get("tags") or [])]
+        if any(t in SKIP_TAGS for t in tags_lower):
+            continue
+        # Must have email or phone to reach them
+        if not (c.get("email") or c.get("emailAddress") or c.get("phone")):
+            continue
+        eligible.append(c)
+
+    if is_dry:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "candidates_total": len(unique),
+            "eligible_for_sync": len(eligible),
+            "would_sync_first_10": [
+                {
+                    "contact_id": c.get("id") or c.get("_id"),
+                    "name": (c.get("contactName") or
+                            f"{c.get('firstName','')} {c.get('lastName','')}").strip(),
+                    "email": c.get("email") or "",
+                    "phone": c.get("phone") or "",
+                    "tags": c.get("tags") or [],
+                }
+                for c in eligible[:10]
+            ],
+        }
+
+    # Process up to max_n
+    eligible = eligible[:max_n]
+    tagged_count = 0
+    sms_sent = 0
+    email_sent = 0
+    errors = []
+
+    for c in eligible:
+        cid = c.get("id") or c.get("_id") or ""
+        if not cid:
+            continue
+        fn = c.get("firstName") or c.get("first_name") or "there"
+        email_addr = c.get("email") or c.get("emailAddress") or ""
+        phone = c.get("phone") or ""
+
+        # Tag first so we don't re-process
+        try:
+            client.add_tags(cid, ["qualifier-cold", "qualifier-fired"])
+            tagged_count += 1
+        except Exception as e:
+            errors.append({"cid": cid, "tag_error": str(e)[:200]})
+            continue
+
+        # Fire qualifier first touch
+        try:
+            touch = _send_qualifier_first_touch(client, cid, fn, email_addr, phone)
+            if touch.get("sms_ok"):
+                sms_sent += 1
+            if touch.get("email_ok"):
+                email_sent += 1
+            if touch.get("errors"):
+                errors.append({"cid": cid, "fn": fn, "touch_errors": touch["errors"]})
+        except Exception as e:
+            errors.append({"cid": cid, "send_error": str(e)[:200]})
+
+    return {
+        "ok": True,
+        "candidates_total": len(unique),
+        "eligible_total": len(eligible),
+        "processed": len(eligible),
+        "tagged_qualifier_cold": tagged_count,
+        "first_touch_sms_sent": sms_sent,
+        "first_touch_email_sent": email_sent,
+        "errors": errors[:15],
+    }
+
+
 @app.post("/admin/pause-contact")
 def admin_pause_contact(token: str = Form(""), query: str = Form("")):
     """Apply pause-ai tag to a contact by partial-name/email/phone search.

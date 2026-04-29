@@ -728,10 +728,34 @@ def chat(
     messages = history[:] if history else []
     messages.append({"role": "user", "content": user_message})
 
+    # Build system prompt with optional Hormozi Frameworks Bible loaded as a
+    # CACHED block (Anthropic prompt caching) — cuts cost ~90% on repeated calls.
+    # The bible is static so it caches well; the main prompt has per-contact
+    # dynamic content so it stays uncached.
+    main_system = build_system_prompt(contact_context)
+    try:
+        from hormozi_brain import format_for_system_prompt as _hormozi_block
+        hormozi_text = _hormozi_block()
+    except Exception as _e:
+        logger.warning("hormozi_brain load failed: %s", _e)
+        hormozi_text = ""
+
+    if hormozi_text:
+        system_param = [
+            {
+                "type": "text",
+                "text": hormozi_text,
+                "cache_control": {"type": "ephemeral"},
+            },
+            {"type": "text", "text": main_system},
+        ]
+    else:
+        system_param = main_system
+
     resp = client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=600,
-        system=build_system_prompt(contact_context),
+        system=system_param,
         messages=messages,
     )
     reply = resp.content[0].text.strip()

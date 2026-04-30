@@ -421,6 +421,20 @@ async def ghl_sms_reply(request: Request):
         or (payload.get("contact") or {}).get("id") or ""
     )
 
+    # HARD-PAUSE: if customer's message contains refund/cancel/legal/accusation
+    # language, AI MUST NEVER reply. Apply pause-ai + needs-human, alert Umar.
+    requires_human, matched = _customer_message_requires_human(message)
+    if requires_human:
+        _hard_pause_and_alert(
+            contact_id, "SMS", "refund/cancel/legal language", matched, message,
+        )
+        return {
+            "ok": True,
+            "skipped": "hard_paused_customer_message",
+            "matched_phrases": matched[:5],
+            "first_name": first_name,
+        }
+
     # Skip if Umar is already replying manually
     if contact_id and _ig_human_active(contact_id):
         logger.info("SMS reply skipped — human active for contact %s", contact_id)
@@ -739,9 +753,89 @@ def _build_scan_breakdown_dm(first_name: str, ig_handle: str, summary, goal_key:
     return body
 
 
+# Customer messages containing ANY of these MUST be human-handled, never AI.
+# These are refund / cancel / legal / accusation patterns where AI replies
+# can create real liability (false promises, missed contractual obligations,
+# escalation triggers). Detecting any of these in an inbound message:
+#   - applies pause-ai + needs-human tags immediately
+#   - alerts Umar via SMS
+#   - returns True so the caller skips AI generation
+_HUMAN_REQUIRED_PHRASES = (
+    # Refund / cancel
+    "refund", "refunded", "refunding",
+    "cancel my", "cancel the", "cancel this", "cancel my subscription",
+    "cancellation", "canceled", "cancelled",
+    "stop charging", "stop the charges", "stop billing",
+    "charge back", "chargeback", "dispute the charge",
+    # Legal escalation
+    "lawyer", "attorney", "lawsuit", "sue you", "sue your",
+    "legal action", "take legal", "my legal team",
+    "bbb", "better business bureau", "ftc", "fcc",
+    "consumer protection", "file a complaint", "filing a complaint",
+    "fraud", "scam", "scammer", "scammed", "fraudulent",
+    # Trust-broken accusations (someone calling out the bot/business)
+    "your face is being used", "you promised", "you said",
+    "i have the message", "i have screenshots", "i have proof",
+    "the contract says", "read your contract", "in the contract",
+    # Spousal/billing escalation
+    "talk to my husband", "talk to my wife", "my partner said",
+)
+
+
+def _customer_message_requires_human(message: str) -> tuple[bool, list[str]]:
+    """Return (requires_human, matched_phrases). If True, AI must NEVER reply."""
+    if not message or not isinstance(message, str):
+        return False, []
+    low = message.lower()
+    matched = [p for p in _HUMAN_REQUIRED_PHRASES if p in low]
+    return bool(matched), matched
+
+
+def _hard_pause_and_alert(contact_id: str, channel: str, reason: str, matched: list[str], message_preview: str = "") -> None:
+    """Immediately apply pause-ai + needs-human tags AND SMS-alert Umar.
+    Used when a customer message contains refund/cancel/legal language so
+    the AI never responds to threads where a human MUST take over."""
+    if not contact_id:
+        return
+    try:
+        from ghl import GHLClient
+        client = GHLClient()
+        client.add_tags(contact_id, ["pause-ai", "needs-human"])
+        logger.warning(
+            "HARD-PAUSE: %s on %s (matched: %s) — pause-ai + needs-human applied",
+            reason, contact_id, matched[:5],
+        )
+    except Exception as _e:
+        logger.error("HARD-PAUSE: failed to apply tags to %s: %s", contact_id, _e)
+    # SMS alert Umar (best-effort)
+    try:
+        notify_phone = os.getenv("UMAR_NOTIFY_PHONE", "").strip()
+        if notify_phone:
+            from ghl import GHLClient
+            _c = GHLClient()
+            preview = (message_preview or "")[:200]
+            alert = (
+                f"[Bully AI HARD-PAUSE] {channel} contact {contact_id[:8]}... "
+                f"sent {reason}. Matched: {', '.join(matched[:3])}. AI is OFF on "
+                f"this thread. Customer said: {preview}"
+            )
+            _c.send_sms(phone=notify_phone, message=alert[:1500])
+    except Exception as _e:
+        logger.warning("HARD-PAUSE: alert SMS failed: %s", _e)
+
+
 def _ig_human_active(contact_id: str) -> bool:
-    """Returns True if Umar has manually replied recently or the contact is
-    flagged pause-ai. Used to short-circuit auto-replies."""
+    """Returns True if AI must NOT reply on this contact's thread.
+
+    FAIL-CLOSED: on ANY error/exception, return True (AI blocked). Better to
+    miss a legitimate AI reply than leak another contact's data or talk over
+    a human refund/cancellation conversation.
+
+    The actual detection logic lives in client.is_human_active() in ghl.py
+    which checks: pause tags → outbound userId → outbound non-API source →
+    takeover phrases ("ai pause", "bully pause", etc.) in recent outbound
+    history → price-haggle/business phrases → settlement language.
+    """
     if not contact_id:
         return False
     try:
@@ -749,8 +843,14 @@ def _ig_human_active(contact_id: str) -> bool:
         client = GHLClient()
         return bool(client.is_human_active(contact_id))
     except Exception as e:
-        logger.warning("_ig_human_active failed (allowing AI to reply): %s", e)
-        return False
+        # FAIL CLOSED — was returning False before (allowing AI through on
+        # errors). That's how Antoine got hit. Now if we can't determine the
+        # state, we assume human is active and block the AI.
+        logger.error(
+            "_ig_human_active EXCEPTION for %s — failing CLOSED (AI blocked): %s",
+            contact_id, e,
+        )
+        return True
 
 
 def _ig_fetch_history(contact_id: str) -> list:
@@ -963,6 +1063,23 @@ async def ig_dm_router(request: Request):
 
     # Human-override check: if Umar manually replied recently, AI stays out of it.
     contact_id = _ig_extract_contact_id(payload)
+
+    # HARD-PAUSE: if the customer's inbound message contains refund / cancel /
+    # legal / accusation language, AI MUST NEVER reply. Apply pause-ai +
+    # needs-human tags and SMS-alert Umar.
+    requires_human, matched = _customer_message_requires_human(message)
+    if requires_human:
+        _hard_pause_and_alert(
+            contact_id, "IG DM", "refund/cancel/legal language", matched, message,
+        )
+        return {
+            "ok": True,
+            "skipped": "hard_paused_customer_message",
+            "matched_phrases": matched[:5],
+            "first_name": first_name,
+            "ig_handle": ig_handle,
+        }
+
     if _ig_human_active(contact_id):
         logger.info("IG DM auto-reply skipped — human active for contact %s", contact_id)
         return {

@@ -437,6 +437,66 @@ class GHLClient:
         logger.warning("send_ig_dm failed for %s: %s", contact_id, last_err)
         return False
 
+    # ---- Public Instagram comment reply (Meta Graph API direct) --------
+    def send_ig_comment_reply(self, comment_id: str, message: str) -> bool:
+        """
+        Post a PUBLIC reply directly under an Instagram comment via Meta Graph API.
+
+        This is the "Sent — check your DMs 📩" reply visible to everyone reading
+        the post. Pairs with send_ig_dm() which sends the actual link privately.
+        The two together form the standard ManyChat/Mazon conversion pattern:
+        public reply for social proof + visibility, DM for the link payload.
+
+        Requires the env var META_IG_PAGE_TOKEN — a Page Access Token with
+        instagram_basic + instagram_manage_comments scopes. Without it, this
+        method silently returns False so the DM-only fallback still works.
+
+        Args:
+          comment_id: the IG comment id to reply to (the one the customer left)
+          message:    public reply text (Meta caps at ~2200 chars but keep <250)
+
+        Returns: True on success, False on any failure (logged).
+        """
+        if not comment_id or not message:
+            return False
+
+        token = (
+            os.getenv("META_IG_PAGE_TOKEN")
+            or os.getenv("FB_PAGE_TOKEN")
+            or os.getenv("INSTAGRAM_PAGE_TOKEN")
+            or ""
+        ).strip()
+        if not token:
+            logger.info(
+                "send_ig_comment_reply: META_IG_PAGE_TOKEN not set — skipping "
+                "public reply (DM-only mode). Set it on Render to enable public "
+                "'check your DMs' replies."
+            )
+            return False
+
+        graph_version = os.getenv("META_GRAPH_VERSION", "v18.0")
+        url = f"https://graph.facebook.com/{graph_version}/{comment_id}/replies"
+        params = {"message": message[:2000], "access_token": token}
+
+        try:
+            r = requests.post(url, params=params, timeout=15)
+        except Exception as e:
+            logger.warning("send_ig_comment_reply network error: %s", e)
+            return False
+
+        if r.ok:
+            logger.info(
+                "send_ig_comment_reply OK → comment %s: %s",
+                comment_id, message[:60],
+            )
+            return True
+
+        logger.warning(
+            "send_ig_comment_reply FAIL → comment %s: %s %s",
+            comment_id, r.status_code, r.text[:300],
+        )
+        return False
+
     # ---- Human-override detection ---------------------------------------
     def is_human_active(self, contact_id: str, auto_tag: bool = True) -> bool:
         """

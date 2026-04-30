@@ -754,9 +754,9 @@ def _build_scan_breakdown_dm(first_name: str, ig_handle: str, summary, goal_key:
 
 
 # Customer messages containing ANY of these MUST be human-handled, never AI.
-# These are refund / cancel / legal / accusation patterns where AI replies
-# can create real liability (false promises, missed contractual obligations,
-# escalation triggers). Detecting any of these in an inbound message:
+# These are refund / cancel / billing-confusion / legal / accusation patterns
+# where AI replies can create real liability (false promises, missed
+# contractual obligations, escalation triggers). Detecting any of these:
 #   - applies pause-ai + needs-human tags immediately
 #   - alerts Umar via SMS
 #   - returns True so the caller skips AI generation
@@ -767,6 +767,15 @@ _HUMAN_REQUIRED_PHRASES = (
     "cancellation", "canceled", "cancelled",
     "stop charging", "stop the charges", "stop billing",
     "charge back", "chargeback", "dispute the charge",
+    # Billing / subscription confusion (Mill / won.printin scenario)
+    "subscription",  "monthly subscription", "my subscription",
+    "billing", "i was charged", "got charged", "i just paid",
+    "i received this email", "just received this email",
+    "what's going on with my", "whats going on with my",
+    "what is this charge", "whats this charge",
+    "my plan", "my monthly", "my account was",
+    "i'm confused on what", "im confused on what",
+    "after paying", "after i paid",
     # Legal escalation
     "lawyer", "attorney", "lawsuit", "sue you", "sue your",
     "legal action", "take legal", "my legal team",

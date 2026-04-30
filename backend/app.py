@@ -440,6 +440,29 @@ async def ghl_sms_reply(request: Request):
         logger.info("SMS reply skipped — human active for contact %s", contact_id)
         return {"ok": True, "skipped": "human_active", "first_name": first_name}
 
+    # ── Keyword shortcut: instant deterministic reply (skip Claude) ──
+    # Customer texts "equifax" → equifaxexposed.com link. GHL workflow's
+    # downstream "Send SMS" step uses {{webhook.response.reply}}.
+    kw_match = _match_keyword_shortcut(message)
+    if kw_match:
+        kw_key, kw_cfg = kw_match
+        kw_reply = _render_keyword_reply(kw_cfg, first_name)
+        _apply_keyword_tags(contact_id, kw_cfg)
+        if contact_id:
+            try:
+                contact_memory.append_turn(contact_id, "user", message)
+                contact_memory.append_turn(contact_id, "assistant", kw_reply)
+            except Exception:
+                pass
+        logger.info("SMS keyword shortcut '%s' fired → contact=%s",
+                    kw_key, contact_id)
+        return {
+            "ok": True,
+            "reply": kw_reply,
+            "first_name": first_name,
+            "keyword_shortcut": kw_key,
+        }
+
     history = payload.get("history") or _ig_fetch_history(contact_id)
 
     # Persistent memory: prefer this contact's full history file from /var/data
@@ -833,6 +856,98 @@ def _hard_pause_and_alert(contact_id: str, channel: str, reason: str, matched: l
         logger.warning("HARD-PAUSE: alert SMS failed: %s", _e)
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Keyword shortcut router — instant deterministic replies for product keywords
+# ──────────────────────────────────────────────────────────────────────────
+# When a customer DMs / comments / texts one of these trigger words, we send
+# the matching product link IMMEDIATELY without invoking Claude. Faster (no
+# LLM round-trip), cheaper (no token spend), and guaranteed-on-message.
+#
+# Match rules:
+#   - Case-insensitive whole-word match against the inbound message
+#   - First match wins (in dict insertion order)
+#   - Multi-word triggers like "equifax exposed" are matched by substring
+#   - The trigger word can be the entire message OR appear in a sentence:
+#        "equifax"                       → match
+#        "send me the equifax link"      → match
+#        "tell me about equifax"         → match (substring)
+#
+# Each shortcut applies tags so we can attribute conversions back to keyword
+# triggers (heat-hot + the keyword-specific tag).
+#
+# Reply templates support {first_name} interpolation.
+
+_KEYWORD_SHORTCUTS: dict = {
+    # ─── Equifax Exposed ($27 limited-time, normally $666) ─────────────────
+    # Trigger: someone DMs/comments/texts "equifax" (or "equifax exposed",
+    # "send equifax", etc.). Drops the equifaxexposed.com link with a clean
+    # urgency hook.
+    "equifax": {
+        "triggers": ("equifax", "equifax exposed", "send equifax",
+                     "the equifax link", "equifax link", "equifax book",
+                     "equifax guide"),
+        "reply_template": (
+            "{name_lead}Equifax \"investigates\" disputes in 10 seconds and "
+            "rubber-stamps them. That's a federal violation — and it's exactly "
+            "how their stack is built.\n\n"
+            "Equifax Exposed shows you the playbook to weaponize that against "
+            "them. Normally $666. Today it's $27.\n\n"
+            "https://equifaxexposed.com/\n\n"
+            "Grab it before the price flips back."
+        ),
+        "tags": ("equifax-keyword", "equifax-exposed-link-sent", "heat-hot"),
+    },
+    # Future shortcuts go here. Examples to add later:
+    #   "transunion": {...}
+    #   "experian":  {...}
+    #   "vault":     {...}
+}
+
+
+def _match_keyword_shortcut(message: str) -> "Optional[tuple[str, dict]]":
+    """Return (shortcut_key, shortcut_dict) if the inbound message matches a
+    keyword trigger, else None. Case-insensitive substring match. The first
+    shortcut whose triggers contain a match wins.
+    """
+    if not message or not isinstance(message, str):
+        return None
+    low = message.lower().strip()
+    if not low:
+        return None
+    for key, cfg in _KEYWORD_SHORTCUTS.items():
+        for trig in cfg.get("triggers", ()):
+            if trig in low:
+                return key, cfg
+    return None
+
+
+def _render_keyword_reply(cfg: dict, first_name: str) -> str:
+    """Render the reply template with first_name interpolation. Adds a
+    leading 'Name — ' prefix when first_name is known, blank otherwise."""
+    fn = (first_name or "").strip()
+    name_lead = f"{fn.split()[0]} — " if fn else ""
+    template = cfg.get("reply_template", "")
+    try:
+        return template.format(name_lead=name_lead, first_name=fn)
+    except Exception:
+        return template
+
+
+def _apply_keyword_tags(contact_id: str, cfg: dict) -> None:
+    """Tag the contact for attribution + heat scoring. Best-effort — failures
+    don't block the reply."""
+    if not contact_id:
+        return
+    tags = list(cfg.get("tags") or ())
+    if not tags:
+        return
+    try:
+        from ghl import GHLClient
+        GHLClient().add_tags(contact_id, tags)
+    except Exception as e:
+        logger.warning("keyword-shortcut: tag apply failed for %s: %s", contact_id, e)
+
+
 def _ig_human_active(contact_id: str) -> bool:
     """Returns True if AI must NOT reply on this contact's thread.
 
@@ -974,6 +1089,26 @@ async def ig_comment_router(request: Request):
 
     logger.info("IG comment from %s (@%s): %r", first_name, ig_handle, comment[:80])
 
+    # ── Keyword shortcut: instant deterministic reply (skip Claude) ──
+    # Example: "equifax" → equifaxexposed.com link. Tags applied for attribution.
+    kw_match = _match_keyword_shortcut(comment)
+    if kw_match:
+        kw_key, kw_cfg = kw_match
+        kw_reply = _render_keyword_reply(kw_cfg, first_name)
+        kw_contact_id = _ig_extract_contact_id(payload)
+        kw_comment_id = _ig_extract_comment_id(payload)
+        _apply_keyword_tags(kw_contact_id, kw_cfg)
+        sent = _ig_send_dm_safe(kw_contact_id, kw_reply, comment_id=kw_comment_id)
+        logger.info("IG comment keyword shortcut '%s' fired → contact=%s sent=%s",
+                    kw_key, kw_contact_id, bool(sent))
+        return {
+            "ok": True,
+            "reply": kw_reply,
+            "first_name": first_name,
+            "keyword_shortcut": kw_key,
+            "sent_via_backend": bool(sent),
+        }
+
     # Build context for Bully AI
     ctx = {
         "channel": "instagram",
@@ -1096,6 +1231,31 @@ async def ig_dm_router(request: Request):
             "skipped": "human_active",
             "first_name": first_name,
             "ig_handle": ig_handle,
+        }
+
+    # ── Keyword shortcut: instant deterministic reply (skip Claude) ──
+    # Customer DMs "equifax" → equifaxexposed.com link. Faster than LLM,
+    # zero token cost, guaranteed message. Tags fire for attribution.
+    kw_match = _match_keyword_shortcut(message)
+    if kw_match:
+        kw_key, kw_cfg = kw_match
+        kw_reply = _render_keyword_reply(kw_cfg, first_name)
+        _apply_keyword_tags(contact_id, kw_cfg)
+        sent = _ig_send_dm_safe(contact_id, kw_reply)
+        if contact_id:
+            try:
+                contact_memory.append_turn(contact_id, "assistant", kw_reply)
+            except Exception:
+                pass
+        logger.info("IG DM keyword shortcut '%s' fired → contact=%s sent=%s",
+                    kw_key, contact_id, bool(sent))
+        return {
+            "ok": True,
+            "reply": kw_reply,
+            "first_name": first_name,
+            "ig_handle": ig_handle,
+            "keyword_shortcut": kw_key,
+            "sent_via_backend": bool(sent),
         }
 
     # Pull conversation history from GHL so Bully AI has memory of prior turns.

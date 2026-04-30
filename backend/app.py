@@ -931,18 +931,48 @@ _KEYWORD_SHORTCUTS: dict = {
 
 def _match_keyword_shortcut(message: str) -> "Optional[tuple[str, dict]]":
     """Return (shortcut_key, shortcut_dict) if the inbound message matches a
-    keyword trigger, else None. Case-insensitive substring match. The first
-    shortcut whose triggers contain a match wins.
+    keyword trigger, else None.
+
+    Two-pass match to handle real-world mobile typing:
+      Pass 1 — exact case-insensitive substring (catches "equifax", "send me
+               the equifax link", "EQUIFAX EXPOSED", etc.)
+      Pass 2 — fuzzy whole-word match using difflib SequenceMatcher with
+               cutoff 0.75. Catches typos like "Exquifax", "Equifaxx",
+               "Equafax", "Equifx" that real customers send from phones.
+               Without this, the bot just asks "what's going on?" instead of
+               firing the shortcut and the sale walks. Real example:
+               "Exquifax" missed → "Exquifax!" missed → customer ghost.
     """
     if not message or not isinstance(message, str):
         return None
     low = message.lower().strip()
     if not low:
         return None
+
+    # Pass 1 — exact substring match (fast path)
     for key, cfg in _KEYWORD_SHORTCUTS.items():
         for trig in cfg.get("triggers", ()):
             if trig in low:
                 return key, cfg
+
+    # Pass 2 — fuzzy word-level match for typos
+    import difflib, re as _re
+    # Pull alphanumeric tokens 4+ chars (skip articles, prepositions)
+    tokens = [t for t in _re.findall(r"[a-z0-9']{4,}", low) if t]
+    if not tokens:
+        return None
+    for key, cfg in _KEYWORD_SHORTCUTS.items():
+        # Only fuzzy-match against single-word triggers (multi-word triggers
+        # like "send equifax" are intentionally exact-only — they imply specific
+        # intent that a single typo'd word wouldn't carry).
+        single_word_trigs = [t for t in cfg.get("triggers", ()) if " " not in t]
+        for trig in single_word_trigs:
+            for tok in tokens:
+                # SequenceMatcher ratio ≥ 0.75 catches Exquifax→equifax (0.86),
+                # Equifaxx→equifax (0.93), Equafax→equifax (0.86), Equifx→
+                # equifax (0.92), but NOT random unrelated words.
+                if difflib.SequenceMatcher(None, tok, trig).ratio() >= 0.75:
+                    return key, cfg
     return None
 
 

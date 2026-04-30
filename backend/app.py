@@ -388,6 +388,18 @@ async def ghl_sms_reply(request: Request):
         logger.warning("SMS reply webhook received empty message: %s", payload)
         return {"reply": "Got your message — let me pull your report and get right back to you.", "ok": False}
 
+    # ── Duplicate inbound dedupe — same fix as IG DM ──
+    _early_cid = (
+        payload.get("contact_id") or payload.get("contactId")
+        or (payload.get("contact") or {}).get("id") or ""
+    )
+    if _is_duplicate_inbound(_early_cid, message):
+        logger.warning(
+            "SMS dedupe: dropping duplicate inbound (cid=%s) — already processed within %ds",
+            _early_cid, _INBOUND_DEDUPE_WINDOW_SEC,
+        )
+        return {"ok": True, "skipped": "duplicate_inbound"}
+
     # Gather as much contact context as GHL passed
     first_name = (
         payload.get("first_name")
@@ -808,6 +820,58 @@ def _build_scan_breakdown_dm(first_name: str, ig_handle: str, summary, goal_key:
 #   - applies pause-ai + needs-human tags immediately
 #   - alerts Umar via SMS
 #   - returns True so the caller skips AI generation
+# ─────────────────────────────────────────────────────────────────────────
+# Inbound dedupe — prevent Bully AI multi-fire when GHL sends the same DM
+# multiple times (multiple workflows on same trigger, retries, etc.)
+# ─────────────────────────────────────────────────────────────────────────
+# Real-world bug: customer sends "Equifax" once, GHL fires our webhook 4-5
+# times in <2s, each invocation calls Claude → 4-5 Bully AI replies stack
+# on the customer's DM thread + 4-5 Anthropic API charges per inbound.
+#
+# Defense: hash (contact_id, lowercased message text). If the same hash was
+# processed in the last DEDUPE_WINDOW_SECONDS, return immediately with
+# skipped:duplicate. Process-local dict (single-worker assumption). On
+# multi-worker Render deployments this fails open (worst case = 1 dup
+# slips through per worker, still way better than current 5x fan-out).
+
+import time as _time_module
+import hashlib as _hashlib_module
+
+_RECENT_INBOUND_HASHES: dict = {}
+_INBOUND_DEDUPE_WINDOW_SEC = 30
+
+
+def _is_duplicate_inbound(contact_id: str, message: str) -> bool:
+    """Returns True if (contact_id, message) was processed in the last 30s.
+
+    Records the hash if it's new (so the next call within the window
+    returns True). Side-effect: garbage-collects entries older than 2x
+    the window to keep the map bounded.
+    """
+    if not contact_id or not message:
+        return False
+    norm = message.strip().lower()
+    if not norm:
+        return False
+    msg_hash = _hashlib_module.md5(norm.encode("utf-8", "replace")).hexdigest()[:16]
+    key = f"{contact_id}::{msg_hash}"
+    now = _time_module.time()
+    last = _RECENT_INBOUND_HASHES.get(key, 0.0)
+    if (now - last) < _INBOUND_DEDUPE_WINDOW_SEC:
+        # Update the timestamp anyway so we extend the silence window if
+        # GHL keeps retrying the same dup.
+        _RECENT_INBOUND_HASHES[key] = now
+        return True
+    _RECENT_INBOUND_HASHES[key] = now
+    # Light gc — keep the map bounded
+    if len(_RECENT_INBOUND_HASHES) > 2000:
+        cutoff = now - (_INBOUND_DEDUPE_WINDOW_SEC * 2)
+        stale = [k for k, v in _RECENT_INBOUND_HASHES.items() if v < cutoff]
+        for k in stale:
+            _RECENT_INBOUND_HASHES.pop(k, None)
+    return False
+
+
 _HUMAN_REQUIRED_PHRASES = (
     # Refund / cancel
     "refund", "refunded", "refunding",
@@ -1144,6 +1208,15 @@ async def ig_comment_router(request: Request):
 
     logger.info("IG comment from %s (@%s): %r", first_name, ig_handle, comment[:80])
 
+    # ── Duplicate inbound dedupe — same fix as IG DM ──
+    _early_cid = _ig_extract_contact_id(payload)
+    if _is_duplicate_inbound(_early_cid, comment):
+        logger.warning(
+            "IG comment dedupe: dropping duplicate (cid=%s) — already processed within %ds",
+            _early_cid, _INBOUND_DEDUPE_WINDOW_SEC,
+        )
+        return {"ok": True, "skipped": "duplicate_inbound", "first_name": first_name}
+
     # ── Keyword shortcut: instant deterministic reply (skip Claude) ──
     # Two-part response (the ManyChat/Mazon conversion playbook):
     #   1. PUBLIC comment reply visible on the post: "Sent. Check your DMs 💌"
@@ -1279,6 +1352,26 @@ async def ig_dm_router(request: Request):
         custom["ig_handle"] = ig_handle
 
     logger.info("IG DM from %s (@%s): %r", first_name, ig_handle, message[:80])
+
+    # ── Duplicate inbound dedupe (CRITICAL: stops Bully AI multi-fire) ──
+    # If the same (contact_id, message) was processed within the last 30s,
+    # return immediately. GHL sometimes fires the same webhook 4-5 times
+    # for one inbound DM (multiple workflows or retries), each invocation
+    # would otherwise burn an Anthropic API call + spam the customer's
+    # thread. Real bug from prod: customer Rasheed got 4 stacked AI replies
+    # on a single "Equifax" DM before the keyword shortcut finally fired.
+    _early_cid = _ig_extract_contact_id(payload)
+    if _is_duplicate_inbound(_early_cid, message):
+        logger.warning(
+            "IG DM dedupe: dropping duplicate inbound from %s (cid=%s) — already processed within %ds",
+            first_name or ig_handle, _early_cid, _INBOUND_DEDUPE_WINDOW_SEC,
+        )
+        return {
+            "ok": True,
+            "skipped": "duplicate_inbound",
+            "first_name": first_name,
+            "ig_handle": ig_handle,
+        }
 
     # Already-scanned reconciliation — if they claim to have uploaded, harvest
     # email from their message, look up the GHL contact, pull scan data into
@@ -3007,6 +3100,141 @@ def _parse_csv_leads(csv_text: str) -> list:
     return out
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Campaign-specific first-touch templates.
+# ─────────────────────────────────────────────────────────────────────────
+# Some Meta lead ads have a very specific hook (e.g. the "Equifax has never
+# read your dispute letter" reel). For those campaigns we skip the generic
+# empathy-opener and drop straight into the matching pitch + the matching
+# product link. The campaign key arrives via the GHL workflow's webhook
+# Custom Data field (e.g. campaign=equifax-dispute-letter).
+
+_EQUIFAX_CAMPAIGN_SMS = (
+    "{fn} — Umar here from Bureau Bullies. Thanks for filling out the form.\n\n"
+    "Here's what Equifax actually does when you dispute: they never read your "
+    "letter. They summarize the first line, generate a 2-digit code, then wait "
+    "30 days to send you \"results.\" That's the entire \"investigation.\" "
+    "It's a federal violation.\n\n"
+    "Equifax Exposed shows you the playbook to weaponize that against them. "
+    "Normally $666. Today: $27.\n\n"
+    "https://equifaxexposed.com/\n\n"
+    "Grab it before the price flips back."
+)
+
+_EQUIFAX_CAMPAIGN_EMAIL_SUBJECT = "{fn}, the Equifax secret (and your $27 link)"
+_EQUIFAX_CAMPAIGN_EMAIL_BODY = (
+    "{fn},\n\n"
+    "Umar from Bureau Bullies. Thanks for filling out the form. I texted you "
+    "too — wanted to make sure you got this in writing.\n\n"
+    "Here's what Equifax is actually doing every time you dispute something:\n\n"
+    "They never read your dispute letter. They summarize the first line, "
+    "generate a 2-digit code, fire it off to the furnisher's automated system, "
+    "and then wait 30 days to mail you a form letter saying \"investigation "
+    "complete, info verified.\"\n\n"
+    "That whole \"investigation\" takes under 10 seconds and zero humans "
+    "touched it. That's a federal violation under FCRA §1681i.\n\n"
+    "Equifax Exposed is the complete playbook for using that violation against "
+    "them — how to dispute the way they can't summarize, what to demand, how "
+    "to stack the leverage so they delete the account AND pay you for the "
+    "violations.\n\n"
+    "Normally $666. Today only: $27.\n\n"
+    "https://equifaxexposed.com/\n\n"
+    "Grab it before the price flips back.\n\n"
+    "— Umar\n"
+    "Bureau Bullies LLC\n\n"
+    "P.S. Real customer win this week: Idris had 4 charge-offs Equifax "
+    "\"verified\" in 10 seconds each. He used this exact playbook, got all 4 "
+    "deleted, AND collected a $2,000 check from Equifax for the FCRA "
+    "violations. That's the kind of leverage in here."
+)
+
+# Day 1 / 2 / 3 SMS follow-ups (sent by GHL Wait + Send SMS or by the backend
+# scheduler — these are the source-of-truth templates either way).
+_EQUIFAX_CAMPAIGN_SMS_DAY_1 = (
+    "{fn} — checking in. Did you grab Equifax Exposed yet? Still $27 today: "
+    "https://equifaxexposed.com/\n\n"
+    "Price flips back to $666 once this push ends. Wanted to make sure you "
+    "didn't miss it."
+)
+_EQUIFAX_CAMPAIGN_SMS_DAY_2 = (
+    "{fn} — quick story while the price is still $27.\n\n"
+    "Idris had 4 charge-offs Equifax \"verified\" in 10 seconds each. He ran "
+    "the Equifax Exposed playbook — all 4 deleted AND he collected $2,000 "
+    "from Equifax for the violations.\n\n"
+    "That leverage is in here: https://equifaxexposed.com/\n\n"
+    "$27 for a few more hours."
+)
+_EQUIFAX_CAMPAIGN_SMS_DAY_3 = (
+    "{fn} — last shot. Price on Equifax Exposed flips back to $666 tonight.\n\n"
+    "$27 for the next few hours: https://equifaxexposed.com/\n\n"
+    "After this, you're paying full price or skipping the playbook entirely."
+)
+
+
+def _send_equifax_campaign_first_touch(client, contact_id: str, fn: str,
+                                       email: str, phone: str) -> dict:
+    """Day 0 first-touch for the 'Equifax has never read your dispute letter'
+    Meta lead ad. Drops the equifaxexposed.com $27 link with the matching
+    angle from the ad's hook. Fires SMS + Email in parallel.
+    """
+    result = {"sms_ok": False, "email_ok": False, "errors": [], "variant": "equifax_campaign"}
+    fn_safe = (fn or "there").strip().split()[0] if (fn or "").strip() else "there"
+
+    # Tag for attribution
+    if contact_id:
+        try:
+            client.add_tags(contact_id, [
+                "meta-equifax-ad",
+                "equifax-campaign-day-0",
+                "heat-hot",
+            ])
+        except Exception as _e:
+            logger.warning("equifax campaign tag failed for %s: %s", contact_id, _e)
+
+    # SMS — try contact_id-routed first, fall back to phone
+    if phone or contact_id:
+        try:
+            sms_body = _EQUIFAX_CAMPAIGN_SMS.format(fn=fn_safe)
+            ok = client.send_sms(phone=phone, message=sms_body, contact_id=contact_id) \
+                 if hasattr(client, "send_sms") else False
+            result["sms_ok"] = bool(ok)
+            if not ok:
+                result["errors"].append("equifax sms: send_sms returned False")
+        except Exception as e:
+            result["errors"].append(f"equifax sms: {e}")
+
+    # Email
+    if email:
+        try:
+            subj = _EQUIFAX_CAMPAIGN_EMAIL_SUBJECT.format(fn=fn_safe)
+            plain = _EQUIFAX_CAMPAIGN_EMAIL_BODY.format(fn=fn_safe)
+            from scheduler import _append_signature_and_footer, _plaintext_to_html
+            plain_full = _append_signature_and_footer(plain)
+            html_full = _plaintext_to_html(plain_full)
+            ok = client.send_email(
+                contact_id=contact_id,
+                subject=subj,
+                html=html_full,
+                plain=plain_full,
+            )
+            result["email_ok"] = bool(ok)
+        except Exception as e:
+            result["errors"].append(f"equifax email: {e}")
+
+    # Schedule the 3-day SMS follow-up sequence (Day 1, 2, 3 from now).
+    # Idempotent — re-firing for the same contact won't double-queue.
+    # Auto-cancels at send time if the contact has already purchased.
+    if contact_id and phone:
+        try:
+            from scheduler import schedule_equifax_campaign_followups
+            queued = schedule_equifax_campaign_followups(contact_id, phone, fn_safe)
+            result["followups_scheduled"] = queued
+        except Exception as e:
+            result["errors"].append(f"equifax followup schedule: {e}")
+
+    return result
+
+
 def _send_qualifier_first_touch(client, contact_id: str, fn: str, email: str, phone: str) -> dict:
     """Fire SMS #1 and Email #1 of the cold-lead qualifier sequence.
 
@@ -3384,28 +3612,52 @@ async def ghl_contact_created(request: Request):
     except Exception as e:
         return {"ok": False, "error": f"ghl_init_failed: {e}", "contact_id": cid}
 
-    # Tag first so we don't double-process if GHL re-fires the webhook
+    # Campaign routing — the GHL workflow includes a `campaign` Custom Data
+    # field so we can fire the right pitch for the right ad. Read it from
+    # several common locations (top-level, customData, contact.customData).
+    campaign = (
+        payload.get("campaign")
+        or (payload.get("customData") or {}).get("campaign")
+        or (payload.get("custom_data") or {}).get("campaign")
+        or (contact.get("customData") or {}).get("campaign")
+        or ""
+    ).strip().lower()
+
+    # Tag first so we don't double-process if GHL re-fires the webhook.
+    # Equifax campaign gets its own tag pair so it skips the generic cold
+    # path on future runs (without that, the SKIP check above would block
+    # the campaign-specific message).
     try:
-        client.add_tags(cid, ["qualifier-cold", "qualifier-fired"])
+        if campaign == "equifax-dispute-letter":
+            client.add_tags(cid, ["meta-equifax-ad", "qualifier-fired"])
+        else:
+            client.add_tags(cid, ["qualifier-cold", "qualifier-fired"])
     except Exception as e:
         logger.warning("contact-created webhook: add_tags failed for %s: %s", cid, e)
 
-    # Fire qualifier — same code path as the cron. Synchronous so we can
-    # report the outcome back to the GHL workflow.
+    # Fire the right first-touch path based on which campaign brought them in.
     try:
-        result = _send_qualifier_first_touch(client, cid, fn, email, phone)
+        if campaign == "equifax-dispute-letter":
+            result = _send_equifax_campaign_first_touch(client, cid, fn, email, phone)
+            logger.info(
+                "contact-created EQUIFAX-CAMPAIGN: %s (cid=%s) sms=%s email=%s",
+                fn, cid, result.get("sms_ok"), result.get("email_ok"),
+            )
+        else:
+            result = _send_qualifier_first_touch(client, cid, fn, email, phone)
+            logger.info(
+                "contact-created webhook: %s (cid=%s) sms=%s email=%s variant=%s",
+                fn, cid, result.get("sms_ok"), result.get("email_ok"), result.get("variant"),
+            )
     except Exception as e:
-        logger.exception("contact-created webhook: qualifier touch failed for %s", cid)
+        logger.exception("contact-created webhook: first-touch failed for %s", cid)
         return {"ok": False, "error": str(e)[:500], "contact_id": cid}
 
-    logger.info(
-        "contact-created webhook: %s (cid=%s) sms=%s email=%s",
-        fn, cid, result.get("sms_ok"), result.get("email_ok"),
-    )
     return {
         "ok": True,
         "contact_id": cid,
         "first_name": fn,
+        "campaign": campaign or "(default-qualifier)",
         "tagged": True,
         **result,
     }

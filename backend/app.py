@@ -718,6 +718,27 @@ def _ig_extract_comment_id(payload: dict) -> str:
     return ""
 
 
+def _ig_send_public_comment_reply_safe(comment_id: str, message: str) -> bool:
+    """Wrapper around GHLClient.send_ig_comment_reply that catches all errors
+    so the calling webhook never breaks if the Meta token is missing/expired.
+    Returns True iff the public reply went out."""
+    if not comment_id or not message:
+        return False
+    try:
+        from ghl import GHLClient
+        client = GHLClient()
+        return client.send_ig_comment_reply(comment_id, message)
+    except Exception as e:
+        logger.warning("_ig_send_public_comment_reply_safe error: %s", e)
+        return False
+
+
+# Default public comment reply when a keyword shortcut fires. Short, low-key,
+# emoji-light. The visitor scrolling sees "Sent. Check your DMs ✉️" under the
+# commenter's note — social proof that the brand actually responds.
+_KEYWORD_COMMENT_REPLY = "Sent. Check your DMs 💌"
+
+
 def _ig_send_dm_safe(contact_id: str, reply: str, *, comment_id: str = "") -> bool:
     """Best-effort send an IG DM via GHL Conversations API.
     Never raises — logs and returns False on any failure."""
@@ -1090,6 +1111,10 @@ async def ig_comment_router(request: Request):
     logger.info("IG comment from %s (@%s): %r", first_name, ig_handle, comment[:80])
 
     # ── Keyword shortcut: instant deterministic reply (skip Claude) ──
+    # Two-part response (the ManyChat/Mazon conversion playbook):
+    #   1. PUBLIC comment reply visible on the post: "Sent. Check your DMs 💌"
+    #      → social proof + tells other scrollers how to engage
+    #   2. PRIVATE DM with the actual product link
     # Example: "equifax" → equifaxexposed.com link. Tags applied for attribution.
     kw_match = _match_keyword_shortcut(comment)
     if kw_match:
@@ -1098,14 +1123,27 @@ async def ig_comment_router(request: Request):
         kw_contact_id = _ig_extract_contact_id(payload)
         kw_comment_id = _ig_extract_comment_id(payload)
         _apply_keyword_tags(kw_contact_id, kw_cfg)
+
+        # 1) Public comment reply (best-effort — needs META_IG_PAGE_TOKEN)
+        # Per-keyword override available via cfg["public_comment_reply"], else default.
+        public_reply_text = (
+            kw_cfg.get("public_comment_reply") if isinstance(kw_cfg, dict) else None
+        ) or _KEYWORD_COMMENT_REPLY
+        public_replied = _ig_send_public_comment_reply_safe(kw_comment_id, public_reply_text)
+
+        # 2) Private DM with the link
         sent = _ig_send_dm_safe(kw_contact_id, kw_reply, comment_id=kw_comment_id)
-        logger.info("IG comment keyword shortcut '%s' fired → contact=%s sent=%s",
-                    kw_key, kw_contact_id, bool(sent))
+
+        logger.info(
+            "IG comment keyword shortcut '%s' fired → contact=%s public_reply=%s dm=%s",
+            kw_key, kw_contact_id, public_replied, bool(sent),
+        )
         return {
             "ok": True,
             "reply": kw_reply,
             "first_name": first_name,
             "keyword_shortcut": kw_key,
+            "public_comment_reply_sent": public_replied,
             "sent_via_backend": bool(sent),
         }
 
@@ -1143,11 +1181,19 @@ async def ig_comment_router(request: Request):
     # contact_id wasn't passed in the payload.
     contact_id = _ig_extract_contact_id(payload)
     comment_id = _ig_extract_comment_id(payload)
+
+    # Public comment reply ("Sent. Check your DMs 💌") — same playbook as the
+    # keyword shortcut path. Visible to everyone scrolling = social proof + tells
+    # other viewers our brand actually responds. Best-effort, needs META_IG_PAGE_TOKEN.
+    public_replied = _ig_send_public_comment_reply_safe(comment_id, _KEYWORD_COMMENT_REPLY)
+
+    # Private DM with the actual Bully AI response
     sent = _ig_send_dm_safe(contact_id, reply_text, comment_id=comment_id)
     return {
         "ok": True,
         "reply": reply_text,
         "first_name": first_name,
+        "public_comment_reply_sent": public_replied,
         "sent_via_backend": bool(sent),
     }
 

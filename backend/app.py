@@ -435,13 +435,10 @@ async def ghl_sms_reply(request: Request):
             "first_name": first_name,
         }
 
-    # Skip if Umar is already replying manually
-    if contact_id and _ig_human_active(contact_id):
-        logger.info("SMS reply skipped — human active for contact %s", contact_id)
-        return {"ok": True, "skipped": "human_active", "first_name": first_name}
-
     # ── Keyword shortcut: instant deterministic reply (skip Claude) ──
-    # Customer texts "equifax" → equifaxexposed.com link. GHL workflow's
+    # FIRES BEFORE human-active check — keyword replies are deterministic +
+    # safe, so a past human conversation should NOT block a customer who
+    # explicitly texts "equifax" asking for the link. GHL workflow's
     # downstream "Send SMS" step uses {{webhook.response.reply}}.
     kw_match = _match_keyword_shortcut(message)
     if kw_match:
@@ -462,6 +459,13 @@ async def ghl_sms_reply(request: Request):
             "first_name": first_name,
             "keyword_shortcut": kw_key,
         }
+
+    # Skip Bully AI replies if Umar is already replying manually (runs AFTER
+    # the keyword shortcut so customers explicitly asking for product links
+    # still receive them).
+    if contact_id and _ig_human_active(contact_id):
+        logger.info("SMS reply skipped — human active for contact %s", contact_id)
+        return {"ok": True, "skipped": "human_active", "first_name": first_name}
 
     history = payload.get("history") or _ig_fetch_history(contact_id)
 
@@ -1270,18 +1274,15 @@ async def ig_dm_router(request: Request):
             "ig_handle": ig_handle,
         }
 
-    if _ig_human_active(contact_id):
-        logger.info("IG DM auto-reply skipped — human active for contact %s", contact_id)
-        return {
-            "ok": True,
-            "skipped": "human_active",
-            "first_name": first_name,
-            "ig_handle": ig_handle,
-        }
-
     # ── Keyword shortcut: instant deterministic reply (skip Claude) ──
-    # Customer DMs "equifax" → equifaxexposed.com link. Faster than LLM,
-    # zero token cost, guaranteed message. Tags fire for attribution.
+    # FIRES BEFORE the human-active check — keyword replies are deterministic
+    # + safe (just a product link, no AI hallucination risk), so a past human
+    # conversation should NOT block them. Real example: a customer replied to
+    # an IG story prompt that said "DM Equifax for the $27 link" — they're
+    # explicitly asking for the link. If the contact had any prior manual
+    # conversation, _ig_human_active would silence the AI permanently and the
+    # customer would never get the link they asked for. Keyword first.
+    # Faster than LLM, zero token cost, guaranteed message. Tags for attribution.
     kw_match = _match_keyword_shortcut(message)
     if kw_match:
         kw_key, kw_cfg = kw_match
@@ -1302,6 +1303,18 @@ async def ig_dm_router(request: Request):
             "ig_handle": ig_handle,
             "keyword_shortcut": kw_key,
             "sent_via_backend": bool(sent),
+        }
+
+    # Human-active check — runs AFTER keyword shortcut so customers asking
+    # for a deterministic product link still get it. Blocks the LLM-driven
+    # Bully AI replies for any contact where Umar has manually engaged.
+    if _ig_human_active(contact_id):
+        logger.info("IG DM auto-reply skipped — human active for contact %s", contact_id)
+        return {
+            "ok": True,
+            "skipped": "human_active",
+            "first_name": first_name,
+            "ig_handle": ig_handle,
         }
 
     # Pull conversation history from GHL so Bully AI has memory of prior turns.

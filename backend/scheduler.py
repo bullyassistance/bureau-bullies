@@ -182,6 +182,131 @@ def cancel_drip(contact_id: str, reason: str = "cancelled") -> int:
 MAX_RETRIES = 5
 
 
+# ────────────────────────────────────────────────────────────────────────
+# SMS drip support — used by campaign follow-ups (e.g. Equifax 3-day series)
+# ────────────────────────────────────────────────────────────────────────
+# Rows in the queue can now have a `kind` field of "email" (default, legacy)
+# or "sms". The dispatcher routes accordingly. Idempotent + persistent on
+# /var/data so a Render redeploy doesn't lose scheduled sends.
+
+def enqueue_sms(
+    contact_id: str,
+    phone: str,
+    first_name: str,
+    body: str,
+    *,
+    send_at,
+    campaign: str = "",
+    label: str = "",
+) -> bool:
+    """Queue a single SMS for a contact at a specific datetime.
+
+    De-duplicates on (contact_id, campaign, label) so re-firing the workflow
+    cannot stack 6 SMS for the same lead. Returns True if added, False if
+    a matching row already exists in pending/sent/failed states.
+    """
+    if not contact_id or not phone or not body:
+        logger.warning("enqueue_sms: missing contact_id/phone/body — skipping")
+        return False
+    if isinstance(send_at, datetime):
+        send_at_iso = send_at.isoformat()
+    else:
+        send_at_iso = str(send_at)
+
+    rows = _load_db()
+    # Dedup: same contact + same campaign + same label = already queued
+    if campaign and label:
+        for r in rows:
+            if (r.get("kind") == "sms"
+                and r.get("contact_id") == contact_id
+                and r.get("campaign") == campaign
+                and r.get("label") == label
+                and r.get("status") in ("pending", "sent", "failed")):
+                return False
+
+    now_iso = _now_iso()
+    rows.append({
+        "id": f"sms-{contact_id}-{campaign or 'na'}-{label or 'na'}-{int(time.time())}",
+        "kind": "sms",
+        "contact_id": contact_id,
+        "phone": phone,
+        "first_name": first_name or "",
+        "body": body,
+        "campaign": campaign,
+        "label": label,
+        "send_at": send_at_iso,
+        "status": "pending",
+        "created_at": now_iso,
+        # legacy fields kept blank so _dispatch_due can still inspect a row
+        "contact_email": "",
+        "subject": "",
+        "email_index": 0,
+        "day": 0,
+    })
+    _save_db(rows)
+    logger.info(
+        "enqueue_sms: queued SMS for %s campaign=%s label=%s send_at=%s",
+        contact_id, campaign, label, send_at_iso,
+    )
+    return True
+
+
+# Equifax campaign Day 1 / 2 / 3 SMS templates — kept here (not in app.py) so
+# the scheduler can read them directly without circular imports.
+_EQUIFAX_FOLLOWUP_SMS_DAY_1 = (
+    "{fn} — checking in. Did you grab Equifax Exposed yet? Still $27 today: "
+    "https://equifaxexposed.com/\n\n"
+    "Price flips back to $666 once this push ends. Wanted to make sure you "
+    "didn't miss it."
+)
+_EQUIFAX_FOLLOWUP_SMS_DAY_2 = (
+    "{fn} — quick story while the price is still $27.\n\n"
+    "Idris had 4 charge-offs Equifax \"verified\" in 10 seconds each. He ran "
+    "the Equifax Exposed playbook — all 4 deleted AND he collected $2,000 "
+    "from Equifax for the violations.\n\n"
+    "That leverage is in here: https://equifaxexposed.com/\n\n"
+    "$27 for a few more hours."
+)
+_EQUIFAX_FOLLOWUP_SMS_DAY_3 = (
+    "{fn} — last shot. Price on Equifax Exposed flips back to $666 tonight.\n\n"
+    "$27 for the next few hours: https://equifaxexposed.com/\n\n"
+    "After this, you're paying full price or skipping the playbook entirely."
+)
+
+
+def schedule_equifax_campaign_followups(contact_id: str, phone: str, first_name: str) -> int:
+    """Queue the Day 1, 2, 3 follow-up SMS for an Equifax-campaign lead.
+
+    Idempotent — re-firing for the same contact won't double-queue. Returns
+    the number of rows added (0 to 3). Skips silently if a `purchased-equifax`
+    or `purchased-equifax-on-trial` tag is set externally before send time
+    (handled by the dispatcher's pre-send check).
+    """
+    if not contact_id or not phone:
+        return 0
+    fn = (first_name or "there").strip().split()[0] if (first_name or "").strip() else "there"
+    now = datetime.now(timezone.utc)
+    queued = 0
+    for day, template in (
+        (1, _EQUIFAX_FOLLOWUP_SMS_DAY_1),
+        (2, _EQUIFAX_FOLLOWUP_SMS_DAY_2),
+        (3, _EQUIFAX_FOLLOWUP_SMS_DAY_3),
+    ):
+        body = template.format(fn=fn)
+        ok = enqueue_sms(
+            contact_id=contact_id,
+            phone=phone,
+            first_name=fn,
+            body=body,
+            send_at=now + timedelta(days=day),
+            campaign="equifax-dispute-letter",
+            label=f"day-{day}",
+        )
+        if ok:
+            queued += 1
+    return queued
+
+
 def _due_now(rows: List[dict]) -> List[dict]:
     """Return pending rows AND failed rows (for retry, up to MAX_RETRIES) that
     are due — but NOT rows whose send_at is more than MAX_PAST_DUE_DAYS in the
@@ -284,7 +409,58 @@ def _dispatch_due() -> int:
 
     sent = 0
     for r in due:
+        kind = (r.get("kind") or "email").lower()
         try:
+            # ── SMS rows (campaign follow-ups) ──
+            if kind == "sms":
+                # Pre-send check: skip if contact already converted on this campaign.
+                # Looks for purchased-equifax* or notified-conversion tag via GHL.
+                # Best-effort — failures don't block the SMS.
+                campaign = (r.get("campaign") or "").lower()
+                if campaign == "equifax-dispute-letter":
+                    try:
+                        # Cheap check: pull contact tags, skip if already bought
+                        if hasattr(client, "get_contact_tags"):
+                            tags = [str(t).lower() for t in (client.get_contact_tags(r["contact_id"]) or [])]
+                            if any(t.startswith("purchased-equifax") for t in tags) \
+                               or "notified-conversion" in tags:
+                                r["status"] = "cancelled-converted"
+                                r["dispatched_at"] = _now_iso()
+                                logger.info(
+                                    "SMS dispatch skipped for %s — already converted on equifax campaign",
+                                    r["contact_id"],
+                                )
+                                continue
+                    except Exception:
+                        pass
+
+                ok = False
+                if hasattr(client, "send_sms"):
+                    ok = client.send_sms(
+                        phone=r.get("phone", ""),
+                        message=r["body"],
+                        contact_id=r.get("contact_id", ""),
+                    )
+                r["status"] = "sent" if ok else "failed"
+                r["dispatched_at"] = _now_iso()
+                if ok:
+                    r.pop("error", None)
+                    r["retry_count"] = r.get("retry_count", 0)
+                    sent += 1
+                    logger.info(
+                        "Sent SMS to %s (campaign=%s label=%s): %r",
+                        r.get("phone"), r.get("campaign"), r.get("label"),
+                        r["body"][:60],
+                    )
+                else:
+                    r["retry_count"] = r.get("retry_count", 0) + 1
+                    logger.warning(
+                        "SMS send returned False for %s (retry %d/%d)",
+                        r["contact_id"], r["retry_count"], MAX_RETRIES,
+                    )
+                continue
+
+            # ── Email rows (default, legacy) ──
             body_with_sig = _append_signature_and_footer(r["body"])
             ok = client.send_email(
                 contact_id=r["contact_id"],
@@ -304,7 +480,7 @@ def _dispatch_due() -> int:
                 logger.warning("Email send returned False for %s (retry %d/%d)",
                                r["contact_id"], r["retry_count"], MAX_RETRIES)
         except Exception as e:
-            logger.exception("Email dispatch error for %s: %s", r.get("contact_id"), e)
+            logger.exception("%s dispatch error for %s: %s", kind, r.get("contact_id"), e)
             r["status"] = "failed"
             r["retry_count"] = r.get("retry_count", 0) + 1
             r["error"] = str(e)[:500]

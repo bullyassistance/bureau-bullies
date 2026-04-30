@@ -536,8 +536,73 @@ def _auto_rebuild_queue_from_ghl() -> int:
     return enqueued
 
 
+def _meta_lead_sweep_tick() -> None:
+    """Self-fire qualifier on any new IG/FB lead that landed in GHL since last
+    tick. Runs in-process every POLL_SECONDS via the scheduler loop, so the
+    worst-case lag from "Meta lead lands in GHL" -> "qualifier SMS goes out"
+    is ~60 seconds — no Render cron, no GHL workflow webhook required.
+
+    Talks to the local /admin/sync-fb-leads endpoint via 127.0.0.1 so we
+    re-use the exact same matcher + skip-tags + send path that the cron uses.
+    Idempotent: contacts already tagged qualifier-fired are skipped, so this
+    is safe to run every minute.
+
+    Disable via env: BB_AUTO_META_SWEEP=0
+    """
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+
+    token = (
+        os.getenv("ADMIN_TOKEN")
+        or os.getenv("BB_BOOTSTRAP_ADMIN_TOKEN")
+        or "bb_bootstrap_b9f3e1c4a7d2ae5b16f4938c0e2d77c8"
+    )
+    port = os.getenv("PORT", "10000")
+    # Per-tick cap stays small so this never burns the request budget. With
+    # candidates_total=100 and skip-tag filter, a healthy steady state has
+    # 0-3 eligible per minute, finishing in <2s.
+    payload = urllib.parse.urlencode({
+        "token": token,
+        "limit": "20",
+        "dry_run": "0",
+    }).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/admin/sync-fb-leads",
+        data=payload,
+        method="POST",
+    )
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            body = r.read().decode()
+    except urllib.error.URLError as e:
+        # Don't spam logs - process may be still booting on the very first tick
+        logger.debug("meta-sweep self-call failed: %s", str(e)[:200])
+        return
+    except Exception as e:
+        logger.debug("meta-sweep self-call exception: %s", str(e)[:200])
+        return
+
+    try:
+        j = json.loads(body)
+    except Exception:
+        return
+    fired_sms = j.get("first_touch_sms_sent", 0)
+    fired_email = j.get("first_touch_email_sent", 0)
+    tagged = j.get("tagged_qualifier_cold", 0)
+    if tagged or fired_sms or fired_email:
+        logger.info(
+            "meta-sweep tick: tagged=%d sms=%d email=%d (candidates=%s eligible=%s)",
+            tagged, fired_sms, fired_email,
+            j.get("candidates_total"), j.get("eligible_total"),
+        )
+
+
 async def _poll_loop():
-    """Background async loop that dispatches due emails every POLL_SECONDS.
+    """Background async loop that dispatches due emails every POLL_SECONDS,
+    AND auto-sweeps fresh IG/FB leads in the same tick (zero-config real-time
+    qualifier touch — no external cron required).
 
     Auto-rebuild is ON by default now that the underlying bugs are fixed:
       - cr_scan_completed_at is written on /api/scan, so dates are correct
@@ -564,6 +629,17 @@ async def _poll_loop():
                 logger.info("Scheduler tick: dispatched %d email(s)", n)
         except Exception as e:
             logger.exception("Scheduler tick error: %s", e)
+
+        # Real-time Meta-lead sweep: self-fire qualifier on any new IG/FB
+        # leads that landed in GHL since the last tick. Removes dependency on
+        # Render cron and on the GHL Contact-Created workflow being wired.
+        # Worst-case lag from lead landing in GHL → qualifier SMS = POLL_SECONDS.
+        if os.getenv("BB_AUTO_META_SWEEP", "1") != "0":
+            try:
+                await asyncio.to_thread(_meta_lead_sweep_tick)
+            except Exception as e:
+                logger.warning("meta-lead sweep tick raised: %s", str(e)[:200])
+
         await asyncio.sleep(POLL_SECONDS)
 
 

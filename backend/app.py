@@ -696,6 +696,25 @@ def _ig_as_string(v) -> str:
     return str(v)
 
 
+def _owner_pause_requested(message: str) -> bool:
+    """Detect explicit manual-takeover phrases the customer/owner types.
+
+    When matched, the inbound is silently absorbed: AI does NOT reply, contact
+    is tagged pause-ai + manual-mode. Lets Umar disable the bot from inside a
+    thread without going to the dashboard.
+    """
+    t = (message or "").lower().strip()
+    if not t:
+        return False
+    phrases = (
+        "pause talking", "stop talking", "stop replying", "do not reply",
+        "don't reply", "dont reply", "pause ai", "stop ai", "ai off",
+        "manual mode", "manual takeover", "i got this", "i'll take over",
+        "ill take over", "umar here", "this is umar", "human takeover",
+    )
+    return any(p in t for p in phrases)
+
+
 def _ig_extract_contact_id(payload: dict) -> str:
     """Pull the GHL contact id out of an IG webhook payload, regardless of
     which token name the user wired in the GHL workflow's Custom Data."""
@@ -1372,6 +1391,23 @@ async def ig_dm_router(request: Request):
         payload.get("message") or payload.get("body") or payload.get("text")
         or (payload.get("customData") or {}).get("message") or ""
     ).strip()
+
+    # ── Owner-pause: explicit "pause talking" / "stop ai" / etc. ──────
+    # Lets Umar disable the bot mid-thread by typing a phrase. We tag the
+    # contact pause-ai + manual-mode so future inbound messages also stay
+    # quiet, and silently absorb this message (no reply).
+    if _owner_pause_requested(message):
+        try:
+            from ghl import GHLClient as _GHL
+            _early_cid_for_pause = _ig_extract_contact_id(payload)
+            if _early_cid_for_pause:
+                _GHL().add_tags(_early_cid_for_pause, ["pause-ai", "manual-mode"])
+            logger.info("IG DM owner-pause phrase detected, AI muted on cid=%s",
+                        _early_cid_for_pause or "(unknown)")
+        except Exception as _pe:
+            logger.warning("owner-pause tag apply failed: %s", str(_pe)[:200])
+        return {"ok": True, "skipped": "owner_pause_requested",
+                "first_name": first_name, "ig_handle": ig_handle}
 
     # Build keyword search corpus first — story-replies ship customer text in
     # non-standard fields (story.body, reply_to.text, etc.). Without this we'd

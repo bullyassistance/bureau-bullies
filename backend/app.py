@@ -1373,9 +1373,17 @@ async def ig_dm_router(request: Request):
         or (payload.get("customData") or {}).get("message") or ""
     ).strip()
 
-    if not message:
+    # Build keyword search corpus first — story-replies ship customer text in
+    # non-standard fields (story.body, reply_to.text, etc.). Without this we'd
+    # early-return on "empty message" before the keyword shortcut runs.
+    _corpus_check = _build_keyword_search_corpus(payload, message)
+    if not message and not (_corpus_check or "").strip():
         logger.warning("IG DM webhook received empty message: %s", payload)
         return {"ok": False, "reply": "Yo, what's up? What can I help you with?"}
+    if not message and _corpus_check and _corpus_check.strip():
+        # Use the extracted text so downstream Bully AI / dedupe / human-active
+        # checks all see real content.
+        message = _corpus_check.strip()
 
     first_name = (
         payload.get("first_name") or payload.get("firstName")

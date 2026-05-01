@@ -452,7 +452,7 @@ async def ghl_sms_reply(request: Request):
     # safe, so a past human conversation should NOT block a customer who
     # explicitly texts "equifax" asking for the link. GHL workflow's
     # downstream "Send SMS" step uses {{webhook.response.reply}}.
-    kw_match = _match_keyword_shortcut(message)
+    kw_match = _match_keyword_shortcut(_build_keyword_search_corpus(payload, message))
     if kw_match:
         kw_key, kw_cfg = kw_match
         kw_reply = _render_keyword_reply(kw_cfg, first_name)
@@ -993,6 +993,55 @@ _KEYWORD_SHORTCUTS: dict = {
 }
 
 
+def _build_keyword_search_corpus(payload: dict, primary_message: str) -> str:
+    """Combine every likely text-bearing field from a GHL/Meta inbound payload
+    into a single string for keyword matching.
+
+    Why: For Instagram story-replies, GHL ships the customer's actual reply
+    text in fields like `story.body`, `reply_to.text`, or `attachment.title`
+    instead of the standard `message.body`. The keyword shortcut matcher only
+    looks at one input string, so we widen the net here to capture any string
+    field that might carry the customer's intent ("Equifax", etc.) before
+    handing off to the matcher.
+
+    SAFE: only pulls from fields known to carry user-typed text. Tags,
+    contact metadata, and IDs are intentionally excluded so a tag like
+    "equifax-keyword" can't trigger a false-positive match.
+    """
+    if not isinstance(payload, dict):
+        return primary_message or ""
+
+    parts: list[str] = []
+    if primary_message:
+        parts.append(str(primary_message))
+
+    for k in ("body", "text", "messageBody", "message_body", "content",
+              "caption", "title", "subject"):
+        v = payload.get(k)
+        if isinstance(v, str) and v.strip():
+            parts.append(v)
+
+    for outer in ("message", "reply_to", "replyTo", "story", "story_reply",
+                  "attachment", "attachments", "customData", "custom_data",
+                  "meta", "ig"):
+        outer_val = payload.get(outer)
+        if isinstance(outer_val, dict):
+            for k in ("body", "text", "messageBody", "content", "caption",
+                     "title", "story_text", "message"):
+                v = outer_val.get(k)
+                if isinstance(v, str) and v.strip():
+                    parts.append(v)
+        elif isinstance(outer_val, list):
+            for item in outer_val[:5]:
+                if isinstance(item, dict):
+                    for k in ("body", "text", "caption", "title"):
+                        v = item.get(k)
+                        if isinstance(v, str) and v.strip():
+                            parts.append(v)
+
+    return " ".join(parts).strip() or (primary_message or "")
+
+
 def _match_keyword_shortcut(message: str) -> "Optional[tuple[str, dict]]":
     """Return (shortcut_key, shortcut_dict) if the inbound message matches a
     keyword trigger, else None.
@@ -1223,7 +1272,7 @@ async def ig_comment_router(request: Request):
     #      → social proof + tells other scrollers how to engage
     #   2. PRIVATE DM with the actual product link
     # Example: "equifax" → equifaxexposed.com link. Tags applied for attribution.
-    kw_match = _match_keyword_shortcut(comment)
+    kw_match = _match_keyword_shortcut(_build_keyword_search_corpus(payload, comment))
     if kw_match:
         kw_key, kw_cfg = kw_match
         kw_reply = _render_keyword_reply(kw_cfg, first_name)
@@ -1406,7 +1455,7 @@ async def ig_dm_router(request: Request):
     # conversation, _ig_human_active would silence the AI permanently and the
     # customer would never get the link they asked for. Keyword first.
     # Faster than LLM, zero token cost, guaranteed message. Tags for attribution.
-    kw_match = _match_keyword_shortcut(message)
+    kw_match = _match_keyword_shortcut(_build_keyword_search_corpus(payload, message))
     if kw_match:
         kw_key, kw_cfg = kw_match
         kw_reply = _render_keyword_reply(kw_cfg, first_name)

@@ -24,3 +24,40 @@ services:
         sync: false
       - key: MAX_FILE_MB
         value: "25"
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: META_APP_SECRET
+        sync: false
+      - key: META_IG_PAGE_TOKEN
+        sync: false
+      - key: META_WEBHOOK_VERIFY_TOKEN
+        sync: false
+      - key: BB_SCHEDULER_BACKEND
+        value: json
+      - key: BB_AUTO_META_SWEEP
+        value: "1"
+      - key: BB_AUTO_REBUILD
+        value: "1"
+      - key: GHL_MAX_RETRIES
+        value: "3"
+
+  # Optional but strongly recommended for reliability: a dedicated cron that
+  # dispatches due emails even if the web process loop misses a tick.
+  - type: cron
+    name: bb-dispatch-due-emails
+    runtime: docker
+    schedule: "*/5 * * * *"
+    dockerCommand: "cd /app/backend && python ../tools/run_scheduler_worker.py"
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: GHL_API_KEY
+        sync: false
+      - key: GHL_LOCATION_ID
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: BB_SCHEDULER_BACKEND
+        value: json
+      - key: DATABASE_URL
+        sync: false

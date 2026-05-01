@@ -41,6 +41,17 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
 
+try:
+    from event_log import log_event
+except Exception:  # pragma: no cover
+    def log_event(*args, **kwargs):
+        return None
+
+try:
+    import scheduler_store
+except Exception:  # pragma: no cover
+    scheduler_store = None
+
 logger = logging.getLogger("bureau-bullies.scheduler")
 
 def _default_db_path() -> str:
@@ -75,6 +86,14 @@ def _now_iso() -> str:
 
 
 def _load_db() -> List[dict]:
+    # Optional production store: Postgres/Supabase via DATABASE_URL. Falls back
+    # to the legacy JSON file if not configured or if the DB errors.
+    if scheduler_store is not None:
+        try:
+            if scheduler_store.postgres_enabled():
+                return scheduler_store.load_rows()
+        except Exception as e:
+            logger.warning("Postgres scheduler load failed; falling back to JSON: %s", e)
     with _file_lock:
         if not DB_PATH.exists():
             return []
@@ -82,10 +101,19 @@ def _load_db() -> List[dict]:
             return json.loads(DB_PATH.read_text() or "[]")
         except Exception as e:
             logger.warning("Scheduler DB corrupt (%s) — starting fresh", e)
+            log_event("scheduler_db_corrupt", error=str(e), path=str(DB_PATH))
             return []
 
 
 def _save_db(rows: List[dict]) -> None:
+    if scheduler_store is not None:
+        try:
+            if scheduler_store.postgres_enabled():
+                scheduler_store.save_rows(rows)
+                return
+        except Exception as e:
+            logger.warning("Postgres scheduler save failed; falling back to JSON: %s", e)
+            log_event("scheduler_postgres_save_failed", error=str(e))
     with _file_lock:
         DB_PATH.parent.mkdir(exist_ok=True, parents=True)
         tmp = DB_PATH.with_suffix(".tmp")
@@ -161,6 +189,7 @@ def schedule_email_drip(
         "Scheduled %d emails for %s (%s) — %d skipped as too-old",
         count, contact_id, contact_email, skipped_old,
     )
+    log_event("email_drip_scheduled", contact_id=contact_id, contact_email=contact_email, count=count, skipped_old=skipped_old)
     return count
 
 
@@ -176,6 +205,7 @@ def cancel_drip(contact_id: str, reason: str = "cancelled") -> int:
     if n:
         _save_db(rows)
         logger.info("Cancelled %d pending emails for %s (%s)", n, contact_id, reason)
+        log_event("email_drip_cancelled", contact_id=contact_id, count=n, reason=reason)
     return n
 
 
@@ -452,6 +482,7 @@ def _dispatch_due() -> int:
                         r.get("phone"), r.get("campaign"), r.get("label"),
                         r["body"][:60],
                     )
+                    log_event("sms_sent", contact_id=r.get("contact_id"), campaign=r.get("campaign"), label=r.get("label"))
                 else:
                     r["retry_count"] = r.get("retry_count", 0) + 1
                     logger.warning(
@@ -475,10 +506,20 @@ def _dispatch_due() -> int:
                 r["retry_count"] = r.get("retry_count", 0)
                 sent += 1
                 logger.info("Sent email %d to %s: %r", r["email_index"], r["contact_email"], r["subject"][:60])
+                log_event("email_sent", contact_id=r.get("contact_id"), email_index=r.get("email_index"), subject=r.get("subject"))
             else:
-                r["retry_count"] = r.get("retry_count", 0) + 1
-                logger.warning("Email send returned False for %s (retry %d/%d)",
-                               r["contact_id"], r["retry_count"], MAX_RETRIES)
+                err = (getattr(client, "last_error", "") or "")
+                if "unsubscribed" in err.lower() or "unsubscribe" in err.lower():
+                    r["status"] = "cancelled-unsubscribed"
+                    r["cancelled_at"] = _now_iso()
+                    r["error"] = err[:500]
+                    logger.info("Email cancelled for %s — GHL says user is unsubscribed", r["contact_id"])
+                    log_event("email_cancelled_unsubscribed", contact_id=r.get("contact_id"), error=err[:250])
+                else:
+                    r["retry_count"] = r.get("retry_count", 0) + 1
+                    r["error"] = err[:500]
+                    logger.warning("Email send returned False for %s (retry %d/%d)",
+                                   r["contact_id"], r["retry_count"], MAX_RETRIES)
         except Exception as e:
             logger.exception("%s dispatch error for %s: %s", kind, r.get("contact_id"), e)
             r["status"] = "failed"
@@ -487,6 +528,35 @@ def _dispatch_due() -> int:
 
     _save_db(rows)
     return sent
+
+
+def dispatch_due_once() -> int:
+    """Public one-shot dispatcher for Render Cron/Worker and admin endpoint."""
+    n = _dispatch_due()
+    log_event("scheduler_dispatch_once", dispatched=n)
+    return n
+
+
+def scheduler_dashboard_snapshot(limit: int = 50) -> dict:
+    """Small dashboard payload for pending/sent/failed/cancelled drip visibility."""
+    rows = _load_db()
+    counts = {}
+    for r in rows:
+        status = r.get("status", "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    pending = sorted([r for r in rows if r.get("status") == "pending"], key=lambda x: x.get("send_at") or "")[:limit]
+    failed = sorted([r for r in rows if r.get("status") == "failed"], key=lambda x: x.get("dispatched_at") or x.get("send_at") or "", reverse=True)[:limit]
+    recent_sent = sorted([r for r in rows if r.get("status") == "sent"], key=lambda x: x.get("dispatched_at") or x.get("send_at") or "", reverse=True)[:limit]
+    return {
+        "ok": True,
+        "backend": "postgres" if scheduler_store is not None and scheduler_store.postgres_enabled() else "json",
+        "db_path": str(DB_PATH),
+        "counts": counts,
+        "pending_next": pending,
+        "failed_recent": failed,
+        "sent_recent": recent_sent,
+        "target_daily_conversion_rate": 0.20,
+    }
 
 
 SIGNATURE_PLAIN = (
@@ -732,7 +802,7 @@ def _meta_lead_sweep_tick() -> None:
     token = (
         os.getenv("ADMIN_TOKEN")
         or os.getenv("BB_BOOTSTRAP_ADMIN_TOKEN")
-        or "bb_bootstrap_b9f3e1c4a7d2ae5b16f4938c0e2d77c8"
+        or "REPLACE_WITH_BOOTSTRAP_ADMIN_TOKEN"  # SANITIZED for audit
     )
     port = os.getenv("PORT", "10000")
     # Per-tick cap stays small so this never burns the request budget. With

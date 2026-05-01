@@ -45,6 +45,26 @@ from scheduler import (
     reset_all_failed,
 )
 
+try:
+    from event_log import log_event, read_events
+except Exception:  # pragma: no cover
+    def log_event(*args, **kwargs):
+        return None
+    def read_events(*args, **kwargs):
+        return []
+
+try:
+    from conversion_optimizer import lead_heat_score, should_alert_owner, variant_for_contact, daily_target_note
+except Exception:  # pragma: no cover
+    def lead_heat_score(*args, **kwargs):
+        return 0
+    def should_alert_owner(*args, **kwargs):
+        return False
+    def variant_for_contact(contact_id, channel=""):
+        return "A"
+    def daily_target_note():
+        return "Target conversion rate is a KPI, not a guarantee."
+
 load_dotenv()
 
 logging.basicConfig(
@@ -389,10 +409,7 @@ async def ghl_sms_reply(request: Request):
         return {"reply": "Got your message — let me pull your report and get right back to you.", "ok": False}
 
     # ── Duplicate inbound dedupe — same fix as IG DM ──
-    _early_cid = (
-        payload.get("contact_id") or payload.get("contactId")
-        or (payload.get("contact") or {}).get("id") or ""
-    )
+    _early_cid = _inbound_identity(payload, fallback="sms")
     if _is_duplicate_inbound(_early_cid, message):
         logger.warning(
             "SMS dedupe: dropping duplicate inbound (cid=%s) — already processed within %ds",
@@ -428,10 +445,13 @@ async def ghl_sms_reply(request: Request):
         custom["cr_first_name"] = first_name
 
     # Pull contact_id and conversation history so SMS replies have memory of prior turns
-    contact_id = (
-        payload.get("contact_id") or payload.get("contactId")
-        or (payload.get("contact") or {}).get("id") or ""
-    )
+    contact_id = _ig_extract_contact_id(payload)
+
+    # MANUAL TAKEOVER: if Umar types a pause/stop-AI instruction in the thread,
+    # tag the contact and return no reply.
+    if _owner_pause_requested(message):
+        _hard_pause_and_alert(contact_id, "SMS", "manual takeover command", ["manual-takeover"], message)
+        return {"ok": True, "skipped": "manual_takeover", "first_name": first_name}
 
     # HARD-PAUSE: if customer's message contains refund/cancel/legal/accusation
     # language, AI MUST NEVER reply. Apply pause-ai + needs-human, alert Umar.
@@ -447,11 +467,18 @@ async def ghl_sms_reply(request: Request):
             "first_name": first_name,
         }
 
+    # If Umar/manual-mode already paused this contact, do not send even keyword links.
+    if contact_id and _ig_human_active(contact_id):
+        logger.info("SMS reply skipped before keyword — human active for contact %s", contact_id)
+        return {"ok": True, "skipped": "human_active", "first_name": first_name}
+
     # ── Keyword shortcut: instant deterministic reply (skip Claude) ──
-    # FIRES BEFORE human-active check — keyword replies are deterministic +
+    # Keyword shortcuts are safe deterministic replies, but they still must respect manual pause.
     # safe, so a past human conversation should NOT block a customer who
     # explicitly texts "equifax" asking for the link. GHL workflow's
     # downstream "Send SMS" step uses {{webhook.response.reply}}.
+    # Search corpus widened to all probable text fields (catches payload
+    # variants where the SMS body sits in body/text/customData).
     kw_match = _match_keyword_shortcut(_build_keyword_search_corpus(payload, message))
     if kw_match:
         kw_key, kw_cfg = kw_match
@@ -696,13 +723,46 @@ def _ig_as_string(v) -> str:
     return str(v)
 
 
-def _owner_pause_requested(message: str) -> bool:
-    """Detect explicit manual-takeover phrases the customer/owner types.
+def _walk_payload_values(obj, *, max_depth: int = 5):
+    """Yield (key, value) from nested GHL/Meta webhook payloads."""
+    if max_depth < 0:
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield str(k), v
+            if isinstance(v, (dict, list)):
+                yield from _walk_payload_values(v, max_depth=max_depth - 1)
+    elif isinstance(obj, list):
+        for item in obj[:25]:
+            if isinstance(item, (dict, list)):
+                yield from _walk_payload_values(item, max_depth=max_depth - 1)
 
-    When matched, the inbound is silently absorbed: AI does NOT reply, contact
-    is tagged pause-ai + manual-mode. Lets Umar disable the bot from inside a
-    thread without going to the dashboard.
-    """
+
+def _first_payload_string(payload: dict, keys: set[str]) -> str:
+    keys_l = {k.lower() for k in keys}
+    for k, v in _walk_payload_values(payload):
+        if k.lower() in keys_l and isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _inbound_identity(payload: dict, fallback: str = "") -> str:
+    """Stable identity for dedupe/pause checks, even if contact_id is missing."""
+    cid = _ig_extract_contact_id(payload)
+    if cid:
+        return cid
+    ident = _first_payload_string(payload, {
+        "conversationId", "conversation_id", "messageId", "message_id",
+        "senderId", "sender_id", "fromId", "from_id", "userId", "user_id",
+        "ig_handle", "username", "handle", "phone", "email",
+    })
+    if ident:
+        return ident
+    return fallback or "unknown-inbound"
+
+
+def _owner_pause_requested(message: str) -> bool:
+    """Detect explicit manual-takeover commands typed into the thread."""
     t = (message or "").lower().strip()
     if not t:
         return False
@@ -716,40 +776,43 @@ def _owner_pause_requested(message: str) -> bool:
 
 
 def _ig_extract_contact_id(payload: dict) -> str:
-    """Pull the GHL contact id out of an IG webhook payload, regardless of
-    which token name the user wired in the GHL workflow's Custom Data."""
+    """Pull the GHL contact id out of an IG/GHL webhook payload."""
     if not isinstance(payload, dict):
         return ""
-    candidates = [
-        payload.get("contact_id"),
-        payload.get("contactId"),
-        payload.get("contact_Id"),
-        (payload.get("contact") or {}).get("id") if isinstance(payload.get("contact"), dict) else None,
-        (payload.get("contact") or {}).get("_id") if isinstance(payload.get("contact"), dict) else None,
-        (payload.get("customData") or {}).get("contact_id") if isinstance(payload.get("customData"), dict) else None,
-        (payload.get("customData") or {}).get("contactId") if isinstance(payload.get("customData"), dict) else None,
-    ]
-    for c in candidates:
-        if c and isinstance(c, str) and len(c) >= 8:
-            return c
+
+    explicit = _first_payload_string(payload, {
+        "contact_id", "contactId", "contact_Id", "ghl_contact_id",
+        "contact_id_value", "contactIdValue",
+    })
+    if explicit and len(explicit) >= 8:
+        return explicit
+
+    for wrapper in ("contact", "Contact", "customer", "lead", "person"):
+        obj = payload.get(wrapper)
+        if isinstance(obj, dict):
+            for key in ("id", "_id"):
+                v = obj.get(key)
+                if isinstance(v, str) and len(v) >= 8:
+                    return v
     return ""
 
 
 def _ig_extract_comment_id(payload: dict) -> str:
-    """Optional — pull an IG comment id from the payload so GHL can send a
-    'reply to comment via DM' which bypasses the 24hr engagement rule."""
+    """Optional — pull an IG comment id from the payload."""
     if not isinstance(payload, dict):
         return ""
-    candidates = [
-        payload.get("comment_id"),
-        payload.get("commentId"),
-        payload.get("ig_comment_id"),
-        (payload.get("trigger") or {}).get("comment_id") if isinstance(payload.get("trigger"), dict) else None,
-        (payload.get("customData") or {}).get("comment_id") if isinstance(payload.get("customData"), dict) else None,
-    ]
-    for c in candidates:
-        if c and isinstance(c, str):
-            return c
+    explicit = _first_payload_string(payload, {
+        "comment_id", "commentId", "ig_comment_id", "instagram_comment_id",
+        "replyToCommentId", "reply_to_comment_id",
+    })
+    if explicit:
+        return explicit
+    for wrapper in ("comment", "trigger"):
+        obj = payload.get(wrapper)
+        if isinstance(obj, dict):
+            v = obj.get("id") or obj.get("_id")
+            if isinstance(v, str) and v.strip():
+                return v.strip()
     return ""
 
 
@@ -861,65 +924,33 @@ _INBOUND_DEDUPE_WINDOW_SEC = 30
 
 
 def _is_duplicate_inbound(contact_id: str, message: str) -> bool:
-    """Returns True if (contact_id, message) was processed in the last 30s.
+    """Returns True if (identity, message) was processed in the last 30s.
 
-    Records the hash if it's new (so the next call within the window
-    returns True). Side-effect: garbage-collects entries older than 2x
-    the window to keep the map bounded.
+    `contact_id` is really an identity string: GHL contact id when available,
+    otherwise conversation id / sender id / handle / phone. Older code returned
+    False whenever contact_id was blank, which let GHL duplicate webhooks spam
+    the same IG/text reply multiple times.
     """
-    if not contact_id or not message:
+    if not message:
         return False
+    identity = (contact_id or "unknown-inbound").strip().lower()
     norm = message.strip().lower()
     if not norm:
         return False
     msg_hash = _hashlib_module.md5(norm.encode("utf-8", "replace")).hexdigest()[:16]
-    key = f"{contact_id}::{msg_hash}"
+    key = f"{identity}::{msg_hash}"
     now = _time_module.time()
     last = _RECENT_INBOUND_HASHES.get(key, 0.0)
     if (now - last) < _INBOUND_DEDUPE_WINDOW_SEC:
-        # Update the timestamp anyway so we extend the silence window if
-        # GHL keeps retrying the same dup.
         _RECENT_INBOUND_HASHES[key] = now
         return True
     _RECENT_INBOUND_HASHES[key] = now
-    # Light gc — keep the map bounded
     if len(_RECENT_INBOUND_HASHES) > 2000:
         cutoff = now - (_INBOUND_DEDUPE_WINDOW_SEC * 2)
         stale = [k for k, v in _RECENT_INBOUND_HASHES.items() if v < cutoff]
         for k in stale:
             _RECENT_INBOUND_HASHES.pop(k, None)
     return False
-
-
-_HUMAN_REQUIRED_PHRASES = (
-    # Refund / cancel
-    "refund", "refunded", "refunding",
-    "cancel my", "cancel the", "cancel this", "cancel my subscription",
-    "cancellation", "canceled", "cancelled",
-    "stop charging", "stop the charges", "stop billing",
-    "charge back", "chargeback", "dispute the charge",
-    # Billing / subscription confusion (Mill / won.printin scenario)
-    "subscription",  "monthly subscription", "my subscription",
-    "billing", "i was charged", "got charged", "i just paid",
-    "i received this email", "just received this email",
-    "what's going on with my", "whats going on with my",
-    "what is this charge", "whats this charge",
-    "my plan", "my monthly", "my account was",
-    "i'm confused on what", "im confused on what",
-    "after paying", "after i paid",
-    # Legal escalation
-    "lawyer", "attorney", "lawsuit", "sue you", "sue your",
-    "legal action", "take legal", "my legal team",
-    "bbb", "better business bureau", "ftc", "fcc",
-    "consumer protection", "file a complaint", "filing a complaint",
-    "fraud", "scam", "scammer", "scammed", "fraudulent",
-    # Trust-broken accusations (someone calling out the bot/business)
-    "your face is being used", "you promised", "you said",
-    "i have the message", "i have screenshots", "i have proof",
-    "the contract says", "read your contract", "in the contract",
-    # Spousal/billing escalation
-    "talk to my husband", "talk to my wife", "my partner said",
-)
 
 
 def _customer_message_requires_human(message: str) -> tuple[bool, list[str]]:
@@ -1034,12 +1065,14 @@ def _build_keyword_search_corpus(payload: dict, primary_message: str) -> str:
     if primary_message:
         parts.append(str(primary_message))
 
+    # Top-level text fields commonly used by GHL / Meta webhooks
     for k in ("body", "text", "messageBody", "message_body", "content",
               "caption", "title", "subject"):
         v = payload.get(k)
         if isinstance(v, str) and v.strip():
             parts.append(v)
 
+    # Nested objects that may carry the actual reply text for story-replies
     for outer in ("message", "reply_to", "replyTo", "story", "story_reply",
                   "attachment", "attachments", "customData", "custom_data",
                   "meta", "ig"):
@@ -1051,7 +1084,7 @@ def _build_keyword_search_corpus(payload: dict, primary_message: str) -> str:
                 if isinstance(v, str) and v.strip():
                     parts.append(v)
         elif isinstance(outer_val, list):
-            for item in outer_val[:5]:
+            for item in outer_val[:5]:  # cap at 5 attachments
                 if isinstance(item, dict):
                     for k in ("body", "text", "caption", "title"):
                         v = item.get(k)
@@ -1277,7 +1310,7 @@ async def ig_comment_router(request: Request):
     logger.info("IG comment from %s (@%s): %r", first_name, ig_handle, comment[:80])
 
     # ── Duplicate inbound dedupe — same fix as IG DM ──
-    _early_cid = _ig_extract_contact_id(payload)
+    _early_cid = _inbound_identity(payload, fallback="ig-comment")
     if _is_duplicate_inbound(_early_cid, comment):
         logger.warning(
             "IG comment dedupe: dropping duplicate (cid=%s) — already processed within %ds",
@@ -1291,6 +1324,8 @@ async def ig_comment_router(request: Request):
     #      → social proof + tells other scrollers how to engage
     #   2. PRIVATE DM with the actual product link
     # Example: "equifax" → equifaxexposed.com link. Tags applied for attribution.
+    # Search corpus widened to all probable text fields (handles GHL payload
+    # variants where the comment text lives under non-standard keys).
     kw_match = _match_keyword_shortcut(_build_keyword_search_corpus(payload, comment))
     if kw_match:
         kw_key, kw_cfg = kw_match
@@ -1392,34 +1427,9 @@ async def ig_dm_router(request: Request):
         or (payload.get("customData") or {}).get("message") or ""
     ).strip()
 
-    # ── Owner-pause: explicit "pause talking" / "stop ai" / etc. ──────
-    # Lets Umar disable the bot mid-thread by typing a phrase. We tag the
-    # contact pause-ai + manual-mode so future inbound messages also stay
-    # quiet, and silently absorb this message (no reply).
-    if _owner_pause_requested(message):
-        try:
-            from ghl import GHLClient as _GHL
-            _early_cid_for_pause = _ig_extract_contact_id(payload)
-            if _early_cid_for_pause:
-                _GHL().add_tags(_early_cid_for_pause, ["pause-ai", "manual-mode"])
-            logger.info("IG DM owner-pause phrase detected, AI muted on cid=%s",
-                        _early_cid_for_pause or "(unknown)")
-        except Exception as _pe:
-            logger.warning("owner-pause tag apply failed: %s", str(_pe)[:200])
-        return {"ok": True, "skipped": "owner_pause_requested",
-                "first_name": first_name, "ig_handle": ig_handle}
-
-    # Build keyword search corpus first — story-replies ship customer text in
-    # non-standard fields (story.body, reply_to.text, etc.). Without this we'd
-    # early-return on "empty message" before the keyword shortcut runs.
-    _corpus_check = _build_keyword_search_corpus(payload, message)
-    if not message and not (_corpus_check or "").strip():
+    if not message:
         logger.warning("IG DM webhook received empty message: %s", payload)
         return {"ok": False, "reply": "Yo, what's up? What can I help you with?"}
-    if not message and _corpus_check and _corpus_check.strip():
-        # Use the extracted text so downstream Bully AI / dedupe / human-active
-        # checks all see real content.
-        message = _corpus_check.strip()
 
     first_name = (
         payload.get("first_name") or payload.get("firstName")
@@ -1453,7 +1463,7 @@ async def ig_dm_router(request: Request):
     # would otherwise burn an Anthropic API call + spam the customer's
     # thread. Real bug from prod: customer Rasheed got 4 stacked AI replies
     # on a single "Equifax" DM before the keyword shortcut finally fired.
-    _early_cid = _ig_extract_contact_id(payload)
+    _early_cid = _inbound_identity(payload, fallback="ig-dm")
     if _is_duplicate_inbound(_early_cid, message):
         logger.warning(
             "IG DM dedupe: dropping duplicate inbound from %s (cid=%s) — already processed within %ds",
@@ -1474,6 +1484,17 @@ async def ig_dm_router(request: Request):
     # Human-override check: if Umar manually replied recently, AI stays out of it.
     contact_id = _ig_extract_contact_id(payload)
 
+    # MANUAL TAKEOVER: if Umar types a pause/stop-AI instruction in the thread,
+    # tag the contact and return no reply.
+    if _owner_pause_requested(message):
+        _hard_pause_and_alert(contact_id, "IG DM", "manual takeover command", ["manual-takeover"], message)
+        return {
+            "ok": True,
+            "skipped": "manual_takeover",
+            "first_name": first_name,
+            "ig_handle": ig_handle,
+        }
+
     # HARD-PAUSE: if the customer's inbound message contains refund / cancel /
     # legal / accusation language, AI MUST NEVER reply. Apply pause-ai +
     # needs-human tags and SMS-alert Umar.
@@ -1490,8 +1511,18 @@ async def ig_dm_router(request: Request):
             "ig_handle": ig_handle,
         }
 
+    # If Umar/manual-mode already paused this contact, do not send even keyword links.
+    if contact_id and _ig_human_active(contact_id):
+        logger.info("IG DM auto-reply skipped before keyword — human active for contact %s", contact_id)
+        return {
+            "ok": True,
+            "skipped": "human_active",
+            "first_name": first_name,
+            "ig_handle": ig_handle,
+        }
+
     # ── Keyword shortcut: instant deterministic reply (skip Claude) ──
-    # FIRES BEFORE the human-active check — keyword replies are deterministic
+    # Keyword shortcuts are safe deterministic replies, but they still must respect manual pause.
     # + safe (just a product link, no AI hallucination risk), so a past human
     # conversation should NOT block them. Real example: a customer replied to
     # an IG story prompt that said "DM Equifax for the $27 link" — they're
@@ -1499,7 +1530,16 @@ async def ig_dm_router(request: Request):
     # conversation, _ig_human_active would silence the AI permanently and the
     # customer would never get the link they asked for. Keyword first.
     # Faster than LLM, zero token cost, guaranteed message. Tags for attribution.
-    kw_match = _match_keyword_shortcut(_build_keyword_search_corpus(payload, message))
+    #
+    # CRITICAL: For story-replies, GHL sometimes ships the customer's text
+    # in a non-standard field (story.body, reply_to.text, attachment.caption,
+    # etc.) rather than `message.body`. We build a broader search corpus from
+    # every likely text field so the matcher catches "Equifax" no matter where
+    # GHL stuffs it. Real bug: Brandon (@seattle_tycoon), Lil.Chocolate_, and
+    # thefinancialtul each replied "Equifax" to a story sticker — the bot fell
+    # back to Bully AI's generic scan pitch instead of firing the $27 link.
+    kw_search_text = _build_keyword_search_corpus(payload, message)
+    kw_match = _match_keyword_shortcut(kw_search_text)
     if kw_match:
         kw_key, kw_cfg = kw_match
         kw_reply = _render_keyword_reply(kw_cfg, first_name)
@@ -1510,8 +1550,8 @@ async def ig_dm_router(request: Request):
                 contact_memory.append_turn(contact_id, "assistant", kw_reply)
             except Exception:
                 pass
-        logger.info("IG DM keyword shortcut '%s' fired → contact=%s sent=%s",
-                    kw_key, contact_id, bool(sent))
+        logger.info("IG DM keyword shortcut '%s' fired → contact=%s sent=%s (matched_in=%r)",
+                    kw_key, contact_id, bool(sent), kw_search_text[:120])
         return {
             "ok": True,
             "reply": kw_reply,
@@ -1771,7 +1811,7 @@ def admin_backfill_email_drip(token: str = Form("")):
 # Bootstrap fallback token, only used if ADMIN_TOKEN env var is not set.
 # This is intentionally long and random so it can't be guessed; it's checked
 # alongside ADMIN_TOKEN. Once ADMIN_TOKEN is set in Render env, this is moot.
-_BOOTSTRAP_ADMIN_TOKEN = "bb_bootstrap_b9f3e1c4a7d2ae5b16f4938c0e2d77c8"
+_BOOTSTRAP_ADMIN_TOKEN = "REPLACE_WITH_BOOTSTRAP_ADMIN_TOKEN_OR_REMOVE_THIS_FALLBACK"  # SANITIZED for audit
 
 
 def _check_admin(token: str) -> bool:
@@ -2029,7 +2069,9 @@ _PURCHASE_TAGS = {
 # Tags that mean this contact came through the Meta lead funnel
 _META_FUNNEL_TAGS = {
     "qualifier-cold", "qualifier-fired", "fb-form-backfill",
-    "facebook-form-lead", "facebook form lead", "ig-form-lead",
+    "facebook-form-lead", "facebook form lead", "fb-form-lead",
+    "ig-form-lead", "instagram form lead", "meta-lead", "meta lead",
+    "facebook lead", "instagram lead",
 }
 
 
@@ -2168,11 +2210,12 @@ def admin_check_conversions(
         except Exception:
             pass
 
-        # Record in contact memory too
+        # Record in contact memory + event log too
         try:
             contact_memory.record_purchase(cid, product, "")
         except Exception:
             pass
+        log_event("purchase_detected", contact_id=cid, name=full_name, email=email_addr, phone=phone, product=product, source=source_label, tags=c.get("tags") or [])
 
         notified.append({
             "contact_id": cid,
@@ -2396,6 +2439,86 @@ def admin_funnel_stats(token: str = Form("")):
     }
 
 
+@app.post("/admin/qualifier-buyers")
+def admin_qualifier_buyers(token: str = Form("")):
+    """Return the actual contacts who came through the qualifier funnel
+    (qualifier-fired or qualifier-cold tag) AND have made a purchase
+    (tripwire_buyer or dispute vault tag).
+
+    Used to find Meta-funnel conversions by name+email — the funnel-stats
+    endpoint only returns counts.
+    """
+    if not _check_admin(token):
+        return {"ok": False, "error": "unauthorized"}
+
+    from ghl import GHLClient
+    try:
+        client = GHLClient()
+    except Exception as e:
+        return {"ok": False, "error": f"ghl_init_failed: {e}"}
+
+    def _by_tag(tag: str) -> dict:
+        """Return {contact_id: contact_dict} for all contacts with this tag."""
+        out = {}
+        try:
+            batch = client.search_contacts_by_tag(tag, limit=500) if hasattr(client, "search_contacts_by_tag") else []
+            for c in batch:
+                cid = c.get("id") or c.get("_id") or ""
+                if cid:
+                    out[cid] = c
+        except Exception:
+            pass
+        return out
+
+    qualifier = {}
+    qualifier.update(_by_tag("qualifier-fired"))
+    qualifier.update(_by_tag("qualifier-cold"))
+    qualifier.update(_by_tag("fb-form-backfill"))
+
+    purchasers = {}
+    purchasers.update(_by_tag("tripwire_buyer"))
+    purchasers.update(_by_tag("dispute vault"))
+    for t in ("dfy buyer", "purchased-dfy", "paid-pif", "dfy-monthly-active",
+              "purchased-2500", "purchased-2000", "purchased-1500"):
+        purchasers.update(_by_tag(t))
+
+    overlap_ids = set(qualifier.keys()) & set(purchasers.keys())
+
+    results = []
+    for cid in overlap_ids:
+        c = qualifier.get(cid) or purchasers.get(cid) or {}
+        tags = c.get("tags") or []
+        tags_l = [str(t).lower() for t in tags]
+        # Determine product purchased
+        product = "unknown"
+        if any("dfy" in t or "pif" in t for t in tags_l):
+            product = "DFY ($2,500 PIF or $229/mo)"
+        elif "dispute vault" in tags_l:
+            product = "Dispute Vault ($66)"
+        elif "tripwire_buyer" in tags_l:
+            product = "Collection Toolkit ($17)"
+        results.append({
+            "contact_id": cid,
+            "name": (c.get("contactName") or
+                     f"{c.get('firstName','')} {c.get('lastName','')}").strip() or "(no name)",
+            "email": c.get("email") or "",
+            "phone": c.get("phone") or "",
+            "source": c.get("source") or c.get("contactSource") or "",
+            "tags": tags,
+            "product": product,
+            "date_added": c.get("dateAdded") or c.get("createdAt") or "",
+            "ghl_url": f"https://app.gohighlevel.com/v2/location/meX0Ery4aBWtjG0MG0Tu/contacts/detail/{cid}",
+        })
+
+    return {
+        "ok": True,
+        "qualifier_pool": len(qualifier),
+        "purchaser_pool": len(purchasers),
+        "overlap_count": len(overlap_ids),
+        "buyers": results,
+    }
+
+
 @app.post("/admin/lookup-contact")
 def admin_lookup_contact(token: str = Form(""), query: str = Form("")):
     """Read-only contact lookup. Search by name, email, or phone, return the
@@ -2460,6 +2583,42 @@ def admin_lookup_contact(token: str = Form(""), query: str = Form("")):
         })
     return {"ok": True, "matched": True, "query": query, "result_count": len(results), "results": results}
 
+
+
+def _contact_looks_like_meta_lead(c: dict) -> bool:
+    """Best-effort Meta lead detector for GHL contacts.
+
+    GHL may store the lead source in tags, source/contactSource, attribution,
+    form name, or custom fields. This keeps the sweep from depending on one
+    exact tag like "Facebook form lead".
+    """
+    if not isinstance(c, dict):
+        return False
+    hay = []
+    for k in ("source", "contactSource", "origin", "type", "campaign",
+              "formName", "form_name", "leadSource", "lead_source"):
+        v = c.get(k)
+        if isinstance(v, str):
+            hay.append(v)
+    for t in c.get("tags") or []:
+        hay.append(str(t))
+    for outer in ("attributionSource", "lastAttributionSource", "customData", "custom_data"):
+        v = c.get(outer)
+        if isinstance(v, dict):
+            hay.extend(str(x) for x in v.values() if isinstance(x, (str, int, float)))
+        elif isinstance(v, str):
+            hay.append(v)
+    for item in c.get("customFields") or []:
+        if isinstance(item, dict):
+            for v in item.values():
+                if isinstance(v, str):
+                    hay.append(v)
+    blob = " ".join(hay).lower()
+    return any(token in blob for token in (
+        "facebook", "instagram", "meta", "fb form", "ig form",
+        "lead ad", "lead form", "instant form", "equifax-dispute-letter",
+        "equifax expose", "equifax exposed",
+    ))
 
 @app.post("/admin/sync-fb-leads")
 def admin_sync_fb_leads(token: str = Form(""), limit: str = Form("50"), dry_run: str = Form("0")):
@@ -2564,6 +2723,21 @@ def admin_sync_fb_leads(token: str = Form(""), limit: str = Form("50"), dry_run:
     except Exception as e:
         logger.warning("sync-fb-leads source search failed: %s", e)
     _gc.collect()
+
+    # Phase 3: recent-contact fallback. Some GHL Meta forms do NOT keep a clean
+    # source/tag, but the attribution/form/custom fields still reveal Facebook,
+    # Instagram, Meta, or the campaign name. This catches those without relying
+    # on the Contact Created workflow being perfect.
+    try:
+        if hasattr(client, "list_recent_contacts"):
+            recent = client.list_recent_contacts(limit=per_source_cap)
+            meta_recent = [c for c in (recent or []) if _contact_looks_like_meta_lead(c)]
+            _absorb(meta_recent, "recent-meta-fallback")
+            recent = None
+            meta_recent = None
+    except Exception as e:
+        logger.warning("sync-fb-leads recent fallback failed: %s", e)
+    _gc.collect()
     logger.info("sync-fb-leads: %d unique candidates after dedupe", len(unique))
 
     # Filter out contacts already touched OR already purchased.
@@ -2585,6 +2759,8 @@ def admin_sync_fb_leads(token: str = Form(""), limit: str = Form("50"), dry_run:
 
     eligible = []
     for c in unique:
+        if not _contact_looks_like_meta_lead(c):
+            continue
         tags_lower = [str(t).lower() for t in (c.get("tags") or [])]
         if any(t in SKIP_TAGS for t in tags_lower):
             continue
@@ -3705,6 +3881,25 @@ async def ghl_contact_created(request: Request):
     except Exception as e:
         return {"ok": False, "error": f"ghl_init_failed: {e}", "contact_id": cid}
 
+    # If GHL only sent a thin webhook body, fetch the full contact before routing
+    # so we have tags/email/phone/source/customData. This prevents first-touch
+    # failures when the workflow sends only {contact_id}.
+    try:
+        full_contact = None
+        if cid and hasattr(client, "get_contact"):
+            full_contact = client.get_contact(cid)
+        if not full_contact and email and hasattr(client, "search_contact_by_email"):
+            full_contact = client.search_contact_by_email(email)
+        if isinstance(full_contact, dict):
+            contact = {**full_contact, **contact}
+            cid = cid or contact.get("id") or contact.get("_id") or contact.get("contactId") or ""
+            fn = (contact.get("firstName") or contact.get("first_name") or fn or "there")
+            email = (contact.get("email") or contact.get("emailAddress") or email or "")
+            phone = (contact.get("phone") or phone or "")
+            tags_lower = [str(t).lower() for t in (contact.get("tags") or [])]
+    except Exception as e:
+        logger.warning("contact-created webhook: full-contact lookup failed for %s: %s", cid, e)
+
     # Campaign routing — the GHL workflow includes a `campaign` Custom Data
     # field so we can fire the right pitch for the right ad. Read it from
     # several common locations (top-level, customData, contact.customData).
@@ -3756,92 +3951,145 @@ async def ghl_contact_created(request: Request):
     }
 
 
-@app.get("/webhooks/meta/ig")
-async def meta_ig_verify(request: Request):
-    """Meta Graph API webhook GET verification handshake.
-    Returns hub.challenge if hub.verify_token matches our shared secret.
+# ---- Production observability / reliability endpoints -------------------
+@app.post("/admin/dispatch-due")
+def admin_dispatch_due(token: str = Form(...)):
+    """One-shot scheduler dispatcher. Use this from Render Cron every 1-5 min.
+    This makes scheduled emails less dependent on the web process staying alive.
     """
-    from fastapi.responses import PlainTextResponse
+    _check_admin(token)
+    from scheduler import dispatch_due_once
+    n = dispatch_due_once()
+    return {"ok": True, "dispatched": n}
+
+
+@app.get("/admin/drip-dashboard")
+def admin_drip_dashboard(token: str, limit: int = 50):
+    _check_admin(token)
+    from scheduler import scheduler_dashboard_snapshot
+    return scheduler_dashboard_snapshot(limit=limit)
+
+
+@app.get("/admin/events")
+def admin_events(token: str, limit: int = 200, event_type: str = ""):
+    _check_admin(token)
+    return {"ok": True, "events": read_events(limit=limit, event_type=event_type or None)}
+
+
+@app.get("/admin/conversion-dashboard")
+def admin_conversion_dashboard(token: str, limit: int = 1000):
+    """KPI dashboard for the 20% daily conversion target.
+    Uses event log signals; /admin/funnel-stats still pulls from GHL tags.
+    """
+    _check_admin(token)
+    events = read_events(limit=limit)
+    today = datetime.now(timezone.utc).date().isoformat()
+    todays = [e for e in events if str(e.get("ts", ""))[:10] == today]
+    inbound = [e for e in todays if e.get("event_type") in {"inbound_sms", "inbound_ig_dm", "inbound_ig_comment", "meta_webhook_inbound", "lead_first_touch"}]
+    purchases = [e for e in todays if e.get("event_type") == "purchase_detected"]
+    rate = round(len(purchases) / max(1, len(inbound)), 4)
+    return {
+        "ok": True,
+        "date_utc": today,
+        "target_conversion_rate": 0.20,
+        "target_note": daily_target_note(),
+        "inbound_or_first_touch_events_today": len(inbound),
+        "purchases_detected_today": len(purchases),
+        "observed_event_conversion_rate": rate,
+        "observed_event_conversion_rate_pct": round(rate * 100, 2),
+        "below_target": rate < 0.20,
+        "recommended_action_if_below_target": "Increase speed-to-lead, personally call/DM heat_score>=70 leads, test variant B hooks, and check failed outbound sends.",
+    }
+
+
+def _meta_verify_signature(raw_body: bytes, signature: str) -> bool:
+    """Verify Meta X-Hub-Signature-256 using META_APP_SECRET."""
+    import hmac, hashlib
+    secret = os.getenv("META_APP_SECRET", "")
+    if not secret:
+        logger.warning("META_APP_SECRET missing; refusing Meta POST for safety")
+        return False
+    if not signature or not signature.startswith("sha256="):
+        return False
+    expected = "sha256=" + hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def _meta_send_dm_direct(recipient_id: str, message: str) -> bool:
+    """Send direct IG message via Meta Graph API when GHL contact does not exist yet."""
+    import requests
+    token = os.getenv("META_IG_PAGE_TOKEN") or os.getenv("META_PAGE_ACCESS_TOKEN")
+    if not token or not recipient_id or not message:
+        return False
+    url = "https://graph.facebook.com/v19.0/me/messages"
+    payload = {"recipient": {"id": recipient_id}, "message": {"text": message[:1000]}}
+    try:
+        r = requests.post(url, params={"access_token": token}, json=payload, timeout=15)
+        ok = r.ok
+        if not ok:
+            logger.warning("Meta direct DM failed: %s %s", r.status_code, r.text[:250])
+        log_event("meta_direct_dm_sent" if ok else "meta_direct_dm_failed", recipient_id=recipient_id, preview=message[:120], status=getattr(r, "status_code", None))
+        return ok
+    except Exception as e:
+        logger.warning("Meta direct DM exception: %s", e)
+        log_event("meta_direct_dm_failed", recipient_id=recipient_id, error=str(e)[:250])
+        return False
+
+
+@app.get("/webhooks/meta/ig")
+def meta_ig_verify(request: Request):
     params = dict(request.query_params)
-    expected = os.getenv("META_WEBHOOK_VERIFY_TOKEN", "bb_meta_verify_2026")
-    if params.get("hub.mode") == "subscribe" and params.get("hub.verify_token") == expected:
-        return PlainTextResponse(content=params.get("hub.challenge", ""), status_code=200)
-    return PlainTextResponse(content="forbidden", status_code=403)
+    token = os.getenv("META_WEBHOOK_VERIFY_TOKEN", "bb_meta_verify_2026")
+    if params.get("hub.mode") == "subscribe" and params.get("hub.verify_token") == token:
+        return int(params.get("hub.challenge", "0"))
+    raise HTTPException(status_code=403, detail="Meta verify token mismatch")
 
 
 @app.post("/webhooks/meta/ig")
-async def meta_ig_event(request: Request):
-    """Meta Graph API webhook POST: every inbound IG DM, story-reply, and
-    comment hits THIS endpoint directly — bypassing GHL entirely.
+async def meta_ig_webhook(request: Request):
+    """Meta Graph direct webhook with signature validation.
 
-    For each event we run the existing keyword shortcut matcher (so "Equifax"
-    replies fire the equifaxexposed.com link instantly), and send the reply
-    via Meta's /me/messages endpoint using META_IG_PAGE_TOKEN.
-
-    This makes it impossible for an inbound IG message containing a keyword
-    to be missed — even if the sender has no GHL contact, even if GHL's IG
-    integration is misconfigured.
+    This catches IG events that have not yet become a GHL contact. It is a backup
+    path for keyword/autoreply, not a replacement for the richer GHL contact flow.
     """
+    raw = await request.body()
+    sig = request.headers.get("X-Hub-Signature-256", "")
+    if not _meta_verify_signature(raw, sig):
+        raise HTTPException(status_code=403, detail="invalid Meta signature")
     try:
-        payload = await request.json()
+        payload = json.loads(raw.decode("utf-8") or "{}")
     except Exception:
         payload = {}
+    log_event("meta_webhook_received", object=payload.get("object"))
 
-    if (payload.get("object") or "") != "instagram":
-        return {"ok": True, "skipped": "not_ig_object"}
-
-    fired = []
-    for entry in (payload.get("entry") or []):
-        # IG DMs / story-replies arrive as entry[].messaging[]
-        for msg in (entry.get("messaging") or []):
-            sender_id = (msg.get("sender") or {}).get("id", "")
-            message_obj = msg.get("message") or {}
-            text = message_obj.get("text", "") or ""
-            # Build search corpus from this Meta payload (catches story-reply,
-            # attachment caption, reply_to text, etc.)
-            corpus = _build_keyword_search_corpus(msg, text)
-            kw_match = _match_keyword_shortcut(corpus)
-            if not kw_match:
+    processed = 0
+    entries = payload.get("entry") or []
+    for entry in entries:
+        for msg in entry.get("messaging", []) or []:
+            sender_id = ((msg.get("sender") or {}).get("id") or "").strip()
+            text = (((msg.get("message") or {}).get("text")) or ((msg.get("postback") or {}).get("title")) or "").strip()
+            if not sender_id or not text:
                 continue
-            kw_key, kw_cfg = kw_match
-            kw_reply = _render_keyword_reply(kw_cfg, "")
-            sent = _send_meta_ig_dm(sender_id, kw_reply)
-            fired.append({"sender": sender_id, "kw": kw_key, "sent": bool(sent)})
-            logger.info(
-                "Meta-direct IG DM keyword '%s' fired → sender=%s sent=%s",
-                kw_key, sender_id, bool(sent),
-            )
-
-    return {"ok": True, "fired": fired, "fired_count": len(fired)}
-
-
-def _send_meta_ig_dm(igsid: str, text: str) -> bool:
-    """Send an IG DM via Meta Graph API using the page access token.
-
-    Required env: META_IG_PAGE_TOKEN (long-lived page access token from the
-    connected IG-account-linked Facebook Page).
-    """
-    token = os.getenv("META_IG_PAGE_TOKEN", "")
-    if not token or not igsid or not text:
-        return False
-    try:
-        import requests as _rq
-        r = _rq.post(
-            "https://graph.facebook.com/v21.0/me/messages",
-            params={"access_token": token},
-            json={
-                "recipient": {"id": igsid},
-                "message": {"text": text[:1000]},
-                "messaging_type": "RESPONSE",
-            },
-            timeout=15,
-        )
-        if r.ok:
-            return True
-        logger.warning("Meta IG DM send failed (%d): %s", r.status_code, r.text[:200])
-    except Exception as e:
-        logger.warning("Meta IG DM send exception: %s", str(e)[:200])
-    return False
+            processed += 1
+            score = lead_heat_score(msg, text)
+            log_event("meta_webhook_inbound", sender_id=sender_id, text=text, heat_score=score)
+            if _owner_pause_requested(text):
+                log_event("meta_webhook_manual_pause", sender_id=sender_id, text=text)
+                continue
+            kw_match = _match_keyword_shortcut(text)
+            if kw_match:
+                kw_key, kw_cfg = kw_match
+                reply = _render_keyword_reply(kw_cfg, "")
+                sent = _meta_send_dm_direct(sender_id, reply)
+                log_event("keyword_shortcut_sent", channel="meta_direct", sender_id=sender_id, keyword=kw_key, sent=sent, heat_score=score)
+                continue
+            try:
+                reply = bully_chat(user_message=text, contact_context={"channel":"meta_direct", "heat_score": score, "variant": variant_for_contact(sender_id, "meta_direct")}, history=None)
+            except Exception:
+                reply = "Got you. Upload your 3-bureau report here and I’ll show you what’s hurting your score: https://bullyaiagent.com/#upload"
+            sent = _meta_send_dm_direct(sender_id, reply)
+            log_event("ai_reply_sent", channel="meta_direct", sender_id=sender_id, sent=sent, heat_score=score)
+    return {"ok": True, "processed": processed}
 
 
 @app.get("/healthz")

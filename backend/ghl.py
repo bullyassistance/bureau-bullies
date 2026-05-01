@@ -22,9 +22,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Optional
 
 import requests
+
+try:
+    from event_log import log_event
+except Exception:  # pragma: no cover
+    def log_event(*args, **kwargs):
+        return None
 
 logger = logging.getLogger("bureau-bullies.ghl")
 
@@ -58,6 +65,7 @@ class GHLClient:
         if not self.api_key or not self.location_id:
             raise GHLError("GHL_API_KEY and GHL_LOCATION_ID must be set")
         self.version = _detect_version(self.api_key)
+        self.last_error = ""
         logger.info("GHL client initialized (API %s)", self.version)
 
     # ---- Headers ---------------------------------------------------------
@@ -75,6 +83,28 @@ class GHLClient:
     @property
     def base(self) -> str:
         return V2_BASE if self.version == "v2" else V1_BASE
+
+    def _request_with_rate_limit(self, method: str, url: str, *, timeout: int = 20, **kwargs):
+        """GHL request wrapper with basic 429/5xx backoff.
+
+        Honors Retry-After when present. Used for outbound sends, where losing a
+        message hurts conversion most.
+        """
+        max_attempts = int(os.getenv("GHL_MAX_RETRIES", "3"))
+        for attempt in range(1, max_attempts + 1):
+            r = requests.request(method, url, headers=self._headers, timeout=timeout, **kwargs)
+            if r.status_code != 429 and r.status_code < 500:
+                return r
+            retry_after = r.headers.get("Retry-After")
+            try:
+                delay = float(retry_after) if retry_after else min(2 ** attempt, 10)
+            except Exception:
+                delay = min(2 ** attempt, 10)
+            logger.warning("GHL %s %s returned %s; retrying in %.1fs (attempt %d/%d)", method, url, r.status_code, delay, attempt, max_attempts)
+            log_event("ghl_rate_limited", method=method, url=url, status=r.status_code, attempt=attempt, retry_after=retry_after)
+            if attempt < max_attempts:
+                time.sleep(delay)
+        return r
 
     # ---- Ping / sanity ---------------------------------------------------
     def ping(self) -> dict:
@@ -123,7 +153,7 @@ class GHLClient:
                 "fieldKey": field_key,
                 "model": "contact",
             }
-        r = requests.post(url, headers=self._headers, json=payload, timeout=20)
+        r = self._request_with_rate_limit("POST", url, json=payload, timeout=20)
         if not r.ok:
             raise GHLError(f"create_custom_field({name}): {r.status_code} {r.text[:300]}")
         return r.json()
@@ -215,7 +245,7 @@ class GHLClient:
                 "customField": gh_customs,
             }
             url = f"{V1_BASE}/contacts/"
-            r = requests.post(url, headers=self._headers, json=payload, timeout=25)
+            r = self._request_with_rate_limit("POST", url, json=payload, timeout=25)
         else:
             # v2 — array of {id, field_value}
             gh_customs = []
@@ -264,7 +294,9 @@ class GHLClient:
 
         Used by scheduler.py so scheduled emails dispatch without a GHL workflow.
         """
+        self.last_error = ""
         if not contact_id or not subject:
+            self.last_error = "missing contact_id or subject"
             logger.warning("send_email: missing contact_id or subject")
             return False
 
@@ -292,11 +324,14 @@ class GHLClient:
         try:
             r = requests.post(url, headers=self._headers, json=payload, timeout=25)
         except Exception as e:
+            self.last_error = f"network error: {e}"
             logger.warning("send_email network error: %s", e)
             return False
 
         if r.ok:
+            self.last_error = ""
             logger.info("send_email OK → contact %s: %s", contact_id, subject[:60])
+            log_event("ghl_email_sent", contact_id=contact_id, subject=subject[:120])
             return True
 
         # Fallback — some GHL accounts use /v1/contacts/{id}/emails
@@ -306,16 +341,19 @@ class GHLClient:
             else f"{V2_BASE}/contacts/{contact_id}/emails"
         )
         try:
-            r2 = requests.post(alt_url, headers=self._headers, json=payload, timeout=25)
+            r2 = self._request_with_rate_limit("POST", alt_url, json=payload, timeout=25)
             if r2.ok:
                 logger.info("send_email OK via /contacts/emails → %s", contact_id)
+                log_event("ghl_email_sent", contact_id=contact_id, subject=subject[:120], path="contacts_emails")
                 return True
+            self.last_error = f"primary {r.status_code} {r.text[:300]} | alt {r2.status_code} {r2.text[:300]}"
             logger.warning(
                 "send_email failed: primary %s %s | alt %s %s",
                 r.status_code, r.text[:200],
                 r2.status_code, r2.text[:200],
             )
         except Exception as e:
+            self.last_error = f"primary {r.status_code} {r.text[:300]} | alt path error: {e}"
             logger.warning("send_email alt path error: %s", e)
         return False
 
@@ -351,13 +389,14 @@ class GHLClient:
         if phone:
             payload["phone"] = phone
         try:
-            r = requests.post(url, headers=self._headers, json=payload, timeout=15)
+            r = self._request_with_rate_limit("POST", url, json=payload, timeout=15)
         except Exception as e:
             logger.warning("send_sms network error: %s", e)
             return False
         if r.ok:
             logger.info("send_sms OK -> contact=%s phone_tail=%s msg=%r",
                         contact_id or "(none)", phone[-4:] if phone else "", message[:60])
+            log_event("ghl_sms_sent", contact_id=contact_id, phone_tail=phone[-4:] if phone else "", message_preview=message[:120])
             return True
         logger.warning("send_sms failed (%s): %s", r.status_code, r.text[:300])
         return False
@@ -427,6 +466,7 @@ class GHLClient:
                     "send_ig_dm OK (type=%s, comment_id=%s) → contact %s: %s",
                     t, comment_id, contact_id, message[:60],
                 )
+                log_event("ghl_ig_dm_sent", contact_id=contact_id, comment_id=comment_id, type=t, message_preview=message[:120])
                 return True
 
             last_err = f"{t}: {r.status_code} {r.text[:200]}"
@@ -496,6 +536,50 @@ class GHLClient:
             comment_id, r.status_code, r.text[:300],
         )
         return False
+
+    # ---- Contact read/list helpers ----------------------------------------
+    def get_contact(self, contact_id: str) -> dict | None:
+        """Fetch one contact by id. Returns the contact dict or None."""
+        if not contact_id:
+            return None
+        url = f"{V1_BASE}/contacts/{contact_id}" if self.version == "v1" else f"{V2_BASE}/contacts/{contact_id}"
+        try:
+            r = requests.get(url, headers=self._headers, timeout=15)
+        except Exception as e:
+            logger.warning("get_contact network error: %s", e)
+            return None
+        if not r.ok:
+            logger.warning("get_contact failed (%s): %s", r.status_code, r.text[:200])
+            return None
+        data = r.json() or {}
+        return data.get("contact") or data
+
+    def list_recent_contacts(self, limit: int = 100) -> list:
+        """Return recent contacts from GHL for fallback Meta lead sweeping."""
+        limit = max(1, min(int(limit or 100), 200))
+        try:
+            if self.version == "v1":
+                r = requests.get(
+                    f"{V1_BASE}/contacts/",
+                    headers=self._headers,
+                    params={"limit": limit},
+                    timeout=20,
+                )
+            else:
+                r = requests.get(
+                    f"{V2_BASE}/contacts/",
+                    headers=self._headers,
+                    params={"locationId": self.location_id, "limit": limit},
+                    timeout=20,
+                )
+        except Exception as e:
+            logger.warning("list_recent_contacts network error: %s", e)
+            return []
+        if not r.ok:
+            logger.warning("list_recent_contacts failed (%s): %s", r.status_code, r.text[:200])
+            return []
+        data = r.json() or {}
+        return data.get("contacts", []) or []
 
     # ---- Human-override detection ---------------------------------------
     def is_human_active(self, contact_id: str, auto_tag: bool = True) -> bool:

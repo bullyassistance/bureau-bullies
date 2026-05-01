@@ -3720,6 +3720,94 @@ async def ghl_contact_created(request: Request):
     }
 
 
+@app.get("/webhooks/meta/ig")
+async def meta_ig_verify(request: Request):
+    """Meta Graph API webhook GET verification handshake.
+    Returns hub.challenge if hub.verify_token matches our shared secret.
+    """
+    from fastapi.responses import PlainTextResponse
+    params = dict(request.query_params)
+    expected = os.getenv("META_WEBHOOK_VERIFY_TOKEN", "bb_meta_verify_2026")
+    if params.get("hub.mode") == "subscribe" and params.get("hub.verify_token") == expected:
+        return PlainTextResponse(content=params.get("hub.challenge", ""), status_code=200)
+    return PlainTextResponse(content="forbidden", status_code=403)
+
+
+@app.post("/webhooks/meta/ig")
+async def meta_ig_event(request: Request):
+    """Meta Graph API webhook POST: every inbound IG DM, story-reply, and
+    comment hits THIS endpoint directly — bypassing GHL entirely.
+
+    For each event we run the existing keyword shortcut matcher (so "Equifax"
+    replies fire the equifaxexposed.com link instantly), and send the reply
+    via Meta's /me/messages endpoint using META_IG_PAGE_TOKEN.
+
+    This makes it impossible for an inbound IG message containing a keyword
+    to be missed — even if the sender has no GHL contact, even if GHL's IG
+    integration is misconfigured.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    if (payload.get("object") or "") != "instagram":
+        return {"ok": True, "skipped": "not_ig_object"}
+
+    fired = []
+    for entry in (payload.get("entry") or []):
+        # IG DMs / story-replies arrive as entry[].messaging[]
+        for msg in (entry.get("messaging") or []):
+            sender_id = (msg.get("sender") or {}).get("id", "")
+            message_obj = msg.get("message") or {}
+            text = message_obj.get("text", "") or ""
+            # Build search corpus from this Meta payload (catches story-reply,
+            # attachment caption, reply_to text, etc.)
+            corpus = _build_keyword_search_corpus(msg, text)
+            kw_match = _match_keyword_shortcut(corpus)
+            if not kw_match:
+                continue
+            kw_key, kw_cfg = kw_match
+            kw_reply = _render_keyword_reply(kw_cfg, "")
+            sent = _send_meta_ig_dm(sender_id, kw_reply)
+            fired.append({"sender": sender_id, "kw": kw_key, "sent": bool(sent)})
+            logger.info(
+                "Meta-direct IG DM keyword '%s' fired → sender=%s sent=%s",
+                kw_key, sender_id, bool(sent),
+            )
+
+    return {"ok": True, "fired": fired, "fired_count": len(fired)}
+
+
+def _send_meta_ig_dm(igsid: str, text: str) -> bool:
+    """Send an IG DM via Meta Graph API using the page access token.
+
+    Required env: META_IG_PAGE_TOKEN (long-lived page access token from the
+    connected IG-account-linked Facebook Page).
+    """
+    token = os.getenv("META_IG_PAGE_TOKEN", "")
+    if not token or not igsid or not text:
+        return False
+    try:
+        import requests as _rq
+        r = _rq.post(
+            "https://graph.facebook.com/v21.0/me/messages",
+            params={"access_token": token},
+            json={
+                "recipient": {"id": igsid},
+                "message": {"text": text[:1000]},
+                "messaging_type": "RESPONSE",
+            },
+            timeout=15,
+        )
+        if r.ok:
+            return True
+        logger.warning("Meta IG DM send failed (%d): %s", r.status_code, r.text[:200])
+    except Exception as e:
+        logger.warning("Meta IG DM send exception: %s", str(e)[:200])
+    return False
+
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True}

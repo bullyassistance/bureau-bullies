@@ -953,6 +953,21 @@ def _is_duplicate_inbound(contact_id: str, message: str) -> bool:
     return False
 
 
+# Phrases that mean AI must NEVER reply on this thread — refund/cancel/legal
+# triggers. When detected, contact gets pause-ai + needs-human tags and Umar
+# is SMS-alerted. Restored after patched-zip omitted this definition.
+_HUMAN_REQUIRED_PHRASES = (
+    "refund", "chargeback", "charge back", "money back",
+    "cancel my", "cancel subscription", "unsubscribe",
+    "stop messaging", "stop texting", "stop emailing",
+    "lawsuit", "sue you", "attorney", "lawyer", "legal action",
+    "scam", "scammer", "fraud", "fraudulent",
+    "bbb", "better business bureau", "attorney general", "ftc complaint",
+    "delete my account", "delete my data", "remove my data",
+    "report you", "reporting you",
+)
+
+
 def _customer_message_requires_human(message: str) -> tuple[bool, list[str]]:
     """Return (requires_human, matched_phrases). If True, AI must NEVER reply."""
     if not message or not isinstance(message, str):

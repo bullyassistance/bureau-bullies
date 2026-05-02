@@ -4104,6 +4104,37 @@ async def meta_ig_webhook(request: Request):
                 reply = "Got you. Upload your 3-bureau report here and I’ll show you what’s hurting your score: https://bullyaiagent.com/#upload"
             sent = _meta_send_dm_direct(sender_id, reply)
             log_event("ai_reply_sent", channel="meta_direct", sender_id=sender_id, sent=sent, heat_score=score)
+        # ── Instagram Comments (entry[].changes[]) ──────────────────────
+        # Meta delivers IG comment events as changes[].value, NOT messaging[].
+        # Without this branch, comments like "Equifax" on reels never trigger
+        # the auto-reply. ChatFuel was historically handling these; this is the
+        # native replacement.
+        for change in (entry.get("changes") or []):
+            if change.get("field") != "comments":
+                continue
+            value = change.get("value") or {}
+            text = (value.get("text") or "").strip()
+            comment_id = (value.get("id") or "").strip()
+            sender_id = ((value.get("from") or {}).get("id") or "").strip()
+            sender_username = ((value.get("from") or {}).get("username") or "").strip()
+            if not text:
+                continue
+            processed += 1
+            score = lead_heat_score(value, text)
+            log_event("meta_webhook_comment", comment_id=comment_id, username=sender_username, sender_id=sender_id, text=text, heat_score=score)
+            if _owner_pause_requested(text):
+                continue
+            kw_match = _match_keyword_shortcut(text)
+            if not kw_match:
+                continue
+            kw_key, kw_cfg = kw_match
+            public_text = (kw_cfg.get("public_comment_reply") if isinstance(kw_cfg, dict) else None) or _KEYWORD_COMMENT_REPLY
+            public_sent = _ig_send_public_comment_reply_safe(comment_id, public_text)
+            kw_reply = _render_keyword_reply(kw_cfg, sender_username or "")
+            dm_sent = _meta_send_dm_direct(sender_id, kw_reply) if sender_id else False
+            log_event("keyword_shortcut_sent", channel="meta_comment", comment_id=comment_id, username=sender_username, keyword=kw_key, public_sent=public_sent, dm_sent=dm_sent, heat_score=score)
+            logger.info("Meta-direct IG comment keyword '%s' fired → comment=%s public=%s dm=%s", kw_key, comment_id, public_sent, dm_sent)
+
     return {"ok": True, "processed": processed}
 
 
